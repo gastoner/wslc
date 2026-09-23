@@ -16,8 +16,26 @@
  * SPDX-License-Identifier: Apache-2.0
  ***********************************************************************/
 
-import type { ExtensionContext } from '@podman-desktop/api';
+import { vi } from 'vitest';
 
-export async function activate(_extensionContext: ExtensionContext): Promise<void> {}
+export const env = {
+  isWindows: true,
+  createTelemetryLogger: vi.fn(() => ({
+    logError: vi.fn(),
+    logUsage: vi.fn(),
+  })),
+};
 
-export async function deactivate(): Promise<void> {}
+export const process = {
+  exec: vi.fn(async () => ({ stdout: 'wslc 0.1.0', stderr: '' })),
+};
+
+export const provider = {
+  createProvider: vi.fn(() => ({
+    updateStatus: vi.fn(),
+    updateVersion: vi.fn(),
+    registerUpdate: vi.fn(() => ({ dispose: vi.fn() })),
+    registerContainerProviderConnection: vi.fn(() => ({ dispose: vi.fn() })),
+    dispose: vi.fn(),
+  })),
+};
