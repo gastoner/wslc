@@ -1,0 +1,46 @@
+{
+  "name": "wslc",
+  "repository": "https://github.com/podman-desktop/wslc",
+  "homepage": "https://github.com/podman-desktop/wslc#readme",
+  "displayName": "WSL Containers",
+  "description": "Manage WSL Containers on Windows in Podman Desktop",
+  "version": "0.1.0-next",
+  "icon": "icon.png",
+  "publisher": "redhat",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "podman-desktop": "^1.21.0"
+  },
+  "main": "./dist/main.cjs",
+  "scripts": {
+    "build": "vite build",
+    "download-dependencies": "tsx ./scripts/download.ts",
+    "test": "vitest run --coverage",
+    "test:watch": "vitest watch --coverage",
+    "format:check": "biome format",
+    "format:fix": "biome format --write",
+    "lint:check": "eslint . && biome lint",
+    "lint:fix": "eslint . --fix && biome lint --fix",
+    "typecheck": "tsc --noEmit",
+    "watch": "vite build -w"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.14",
+    "@podman-desktop/api": "^1.29.1",
+    "@types/node": "^24.13.6",
+    "@types/semver": "^7.8.0",
+    "@vitest/coverage-v8": "^5.0.1",
+    "adm-zip": "^0.6.1",
+    "eslint": "^10.11.0",
+    "tsx": "^4.23.15",
+    "typescript": "5.9.3",
+    "vite": "8.3.0",
+    "vitest": "^5.0.1"
+  },
+  "packageManager": "pnpm@12.6.0+sha512.3ef68f951cb111ac204b4a5a16f0b2ddf0da56a96e0413e81d855d9f0b55ef926714709028e1cd00c405c2c5fb7b9e8ec4dc46777c805d0373c2f2ff00fd20ec",
+  "dependencies": {
+    "inversify": "^7.11.0",
+    "semver": "^7.8.5"
+  }
+}

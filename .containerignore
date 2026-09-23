@@ -1,0 +1,5 @@
+.git
+.cursor
+coverage
+node_modules
+dist
