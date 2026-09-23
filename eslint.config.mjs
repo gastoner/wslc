@@ -44,6 +44,17 @@ export default defineConfig([
     },
     rules: {
       '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
+      // Methods keep an async signature even when they have nothing to await, so callers can
+      // treat the provider and bridge managers uniformly.
+      '@typescript-eslint/require-await': 'off',
+    },
+  },
+  {
+    files: ['**/*.spec.ts'],
+    rules: {
+      // Tests hand method references to matchers (e.g. `expect(obj.method)`), which the rule flags
+      // even though nothing is ever called with a different receiver.
+      '@typescript-eslint/unbound-method': 'off',
     },
   },
 ]);

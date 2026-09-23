@@ -1,69 +1,123 @@
-# Podman Desktop WSL Containers extension
+# WSL Containers Extension
 
-<p align="center">
-  <img alt="WSL Containers extension icon" src="icon.png" width="128">
-</p>
+This Podman Desktop extension exposes Microsoft's WSL Containers (WSLC) runtime through a Docker-compatible container
+provider on Windows.
 
-## Overview
+## Prerequisites
 
-This repository contains a minimal Podman Desktop extension scaffold for WSL Containers. It is based on [extension-template-minimal](https://github.com/podman-desktop/extension-template-minimal), at commit [`f5e0579`](https://github.com/podman-desktop/extension-template-minimal/commit/f5e0579a7a9815399116edad18f681621912202d), with the build, lint, typecheck, and CI changes required for this repository.
+Install or update WSL from an elevated PowerShell terminal:
 
-The extension entrypoint currently only defines empty `activate` and `deactivate` functions. The WSL Containers provider and bridge integration are not implemented yet.
+```powershell
+wsl --update
+```
 
-See the [Podman Desktop extension documentation](https://podman-desktop.io/docs/extensions) for more information about extension development.
+Open a new terminal and verify WSLC:
 
-## Development
+```powershell
+wslc version
+```
+
+The extension is intended for Windows 10 and Windows 11. Windows Server 2025 has community validation; Windows Server
+2022 is not currently supported. The required WSL package version is 2.9.3 or newer.
+
+## Architecture
+
+The extension launches the standalone `wslc-bridge.exe` for the host architecture. The bridge owns the Windows named
+pipe `\\.\pipe\wslc_engine`; Podman Desktop registers that path directly as the `WSL Containers` Docker connection.
+There is no TCP listener, extension-side socket server, Docker context, or Linux relay.
+
+The Podman Desktop provider uses the raw Windows pipe path. For a Docker CLI client, the equivalent endpoint is
+`npipe:////./pipe/wslc_engine` (for example, `$env:DOCKER_HOST = 'npipe:////./pipe/wslc_engine'`).
+
+The bridge routes each Docker API call to one of WSLC's two planes:
+
+- **`wslc.exe`.** Anything that needs WSLC policy, the Windows port relay, Windows binds, or WSLC lifecycle tracking:
+  - containers: create, start, stop, restart, kill, remove, prune
+  - images: pull, push, build, load, import, tag, remove, prune
+  - networks and volumes: create, remove, prune, plus network connect/disconnect
+- **The Docker daemon in the WSLC guest.** Reads and in-container operations:
+  - lists and inspects, logs, stats, events
+  - pause/unpause, export
+  - attach and exec, including the interactive terminal tab
+
+Container list and inspect responses overlay Windows host-port mappings from native WSLC list output. See the bridge
+README for the full route table and WSL version gates.
+
+## Bridge binaries and local builds
+
+The bridge is built independently in the sibling `wslc-bridge` project. The extension never
+compiles Go. It packages both pinned Windows executables and selects one at runtime:
+
+```text
+dist/bin/win32-x64/wslc-bridge.exe   (Node x64)
+dist/bin/win32-arm64/wslc-bridge.exe (Node ARM64)
+```
+
+The bridge manifest and SHA-256 checksum file pin the exact binary bytes. The extension staging script verifies the
+manifest, both checksums, and each PE machine type before writing either executable. It stages both artifacts
+transactionally; it does not download an unpinned branch or use a TCP fallback.
+
+For local extension development from PowerShell:
+
+```powershell
+$env:WSLC_BRIDGE_ARTIFACT_DIR = (Resolve-Path ..\wslc-bridge\dist).Path
+pnpm install --frozen-lockfile
+pnpm download-dependencies
+pnpm build
+```
+
+For a local OCI build, stage the four bridge files in `build/bridge-artifacts` so the `Containerfile` picks them up:
+
+```powershell
+New-Item -ItemType Directory -Force build\bridge-artifacts | Out-Null
+Copy-Item "$env:WSLC_BRIDGE_ARTIFACT_DIR\*" build\bridge-artifacts\
+podman build -t wslc-local .
+```
+
+The manual `build-next` workflow accepts a base URL for a hosted bridge artifact directory and downloads only the four
+named files before running the same image build. No published bridge release URL is assumed; the artifacts must be
+staged or hosted before running that workflow.
+
+To build and diagnose the standalone executable directly, see the sibling bridge project's README. On Windows, the
+extension starts it, waits for its JSON readiness record and named-pipe health check, polls it every 30 seconds, and
+requests graceful shutdown by closing its stdin when the extension deactivates.
+
+## Testing on Windows without a Docker CLI
+
+After staging the bridge artifacts and building the extension, open Podman Desktop and enable **Settings → Preferences →
+Extensions → Development mode**. In **Extensions → Local extensions**, add this extension folder. Podman Desktop will
+start the bridge and register the `WSL Containers` provider; you do not need `docker.exe` or `podman.exe` to use the UI.
+
+For API-level verification without either CLI, run the PowerShell smoke test from the sibling bridge checkout while the
+extension is active:
+
+```powershell
+..\wslc-bridge\scripts\smoke-test.ps1
+```
+
+It connects directly to the named pipe and tests public image pull, create/start, Windows port relay and bind mount,
+inspect/list overlays, logs, stats, exec exit codes, and network lifecycle.
+
+## Limitations
+
+Private-registry credentials, Compose, Docker-in-Docker, host Docker socket mounts, privileged mode, restart policies,
+`host.docker.internal`, `--add-host`, and interactive exec are not supported. The bridge implements the selected Docker
+API surface rather than every Engine API route; unsupported requests return an explicit error. ARM64 artifacts are
+cross-built; validate them on ARM64 Windows hardware before claiming runtime support.
+
+## Development checks
 
 Prerequisites: Node.js 24 from [`.nvmrc`](.nvmrc) and the pinned pnpm version from [`package.json`](package.json).
 
-1. Clone the repository and install dependencies:
-
-   ```sh
-   git clone https://github.com/podman-desktop/wslc.git
-   cd wslc
-   nvm use
-   corepack enable
-   pnpm install --frozen-lockfile
-   ```
-
-2. Build the extension. Vite writes the Podman Desktop entrypoint to `dist/extension.cjs`:
-
-   ```sh
-   pnpm build
-   ```
-
-   To rebuild automatically after source changes:
-
-   ```sh
-   pnpm watch
-   ```
-
-3. Run the typecheck, linter, and formatter:
-
-   ```sh
-   pnpm typecheck
-   pnpm lint:check
-   pnpm format:check
-   ```
-
-   `pnpm format:fix` rewrites files in place.
-
-4. Load the extension temporarily in Podman Desktop. Clone Podman Desktop, install its dependencies, and run its development build with this repository as the extension folder. For sibling directories:
-
-   ```sh
-   cd ../podman-desktop
-   pnpm install
-   pnpm watch --extension-folder ../wslc
-   ```
-
-   Run `pnpm watch` in this repository in a second terminal. Confirm **WSL Containers** appears in Podman Desktop's **Extensions** view.
-
-## Packaging and publishing
-
-The Containerfile builds the extension from source, so a prebuilt `dist/` directory is not required. Build a local OCI image with:
-
-```sh
-podman build -t localhost/wslc:dev .
+```bash
+nvm use
+corepack enable
+pnpm install --frozen-lockfile
+pnpm typecheck
+pnpm lint:check
+pnpm format:check
+pnpm test
+pnpm build
 ```
 
-For publishing instructions, see the [Podman Desktop publishing documentation](https://podman-desktop.io/docs/extensions/publish). The manually dispatched `release` workflow accepts a semantic version and branch, then publishes the image to `ghcr.io/podman-desktop/wslc:<version>`. Stable releases also receive the `latest` tag; prereleases do not.
+`pnpm format:fix` and `pnpm lint:fix` rewrite files in place. `pnpm watch` rebuilds on change.
