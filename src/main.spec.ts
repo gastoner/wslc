@@ -17,39 +17,51 @@
  ***********************************************************************/
 
 import type { ExtensionContext } from '@podman-desktop/api';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { activate, deactivate } from './main';
 import { WslcExtension } from './wslc-extension';
 
 vi.mock(import('./wslc-extension'));
 
 const extensionContext = { subscriptions: [] } as unknown as ExtensionContext;
+const activateMock = vi.mocked(WslcExtension.prototype.activate);
+const deactivateMock = vi.mocked(WslcExtension.prototype.deactivate);
+
+beforeEach(() => {
+  vi.resetAllMocks();
+});
+
+afterEach(async () => {
+  await deactivate();
+});
 
 describe('main lifecycle', () => {
-  beforeEach(() => {
-    vi.resetAllMocks();
-  });
-
-  afterEach(async () => {
-    await deactivate();
-  });
-
-  it('activates the extension on Windows', async () => {
+  test('creates and activates the extension', async () => {
     await activate(extensionContext);
 
-    expect(WslcExtension.prototype.activate).toHaveBeenCalledOnce();
+    expect(activateMock).toHaveBeenCalledOnce();
   });
 
-  it('reuses the same extension instance on repeated activation', async () => {
+  test('reuses the same extension instance on repeated activation', async () => {
     await activate(extensionContext);
     await activate(extensionContext);
 
     expect(WslcExtension).toHaveBeenCalledOnce();
-    expect(WslcExtension.prototype.activate).toHaveBeenCalledTimes(2);
+    expect(activateMock).toHaveBeenCalledTimes(2);
   });
 
-  it('deactivates safely before activation', async () => {
+  test('clears the extension reference when deactivated before activation', async () => {
     await deactivate();
+
+    expect(deactivateMock).not.toHaveBeenCalled();
+    expect((global as Record<string, unknown>).wslcExtension).toBeUndefined();
+  });
+
+  test('clears the extension reference when deactivation rejects', async () => {
+    await activate(extensionContext);
+    deactivateMock.mockRejectedValueOnce(new Error('deactivation failed'));
+
+    await expect(deactivate()).rejects.toThrow('deactivation failed');
 
     expect((global as Record<string, unknown>).wslcExtension).toBeUndefined();
   });

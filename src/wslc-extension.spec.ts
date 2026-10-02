@@ -17,7 +17,7 @@
  ***********************************************************************/
 
 import type { ExtensionContext, TelemetryLogger } from '@podman-desktop/api';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { env } from '@podman-desktop/api';
 import { WslcExtension } from './wslc-extension';
 import { WslcProviderManager } from './manager/wslc-provider-manager';
@@ -25,40 +25,49 @@ import { WslcProviderManager } from './manager/wslc-provider-manager';
 vi.mock(import('./manager/wslc-provider-manager'));
 
 const extensionContext = { subscriptions: [] } as unknown as ExtensionContext;
+const telemetryLogger = {
+  logError: vi.fn(),
+  logUsage: vi.fn(),
+} as unknown as TelemetryLogger;
+const registerContainerProviderMock = vi.mocked(WslcProviderManager.prototype.registerContainerProvider);
+const deactivateProviderManagerMock = vi.mocked(WslcProviderManager.prototype.deactivate);
+
+beforeEach(() => {
+  vi.resetAllMocks();
+  (env as { isWindows: boolean }).isWindows = true;
+  vi.mocked(env.createTelemetryLogger).mockReturnValue(telemetryLogger);
+});
+
+afterEach(() => {
+  (env as { isWindows: boolean }).isWindows = true;
+});
 
 describe('WslcExtension', () => {
-  beforeEach(() => {
-    vi.resetAllMocks();
-    (env as { isWindows: boolean }).isWindows = true;
-    vi.mocked(env.createTelemetryLogger).mockReturnValue({
-      logError: vi.fn(),
-      logUsage: vi.fn(),
-    } as unknown as TelemetryLogger);
-  });
-
-  it('registers the provider on Windows', async () => {
+  test('registers the provider on Windows', async () => {
     const extension = new WslcExtension(extensionContext);
 
     await extension.activate();
 
-    expect(WslcProviderManager.prototype.registerContainerProvider).toHaveBeenCalledOnce();
+    expect(registerContainerProviderMock).toHaveBeenCalledOnce();
+    expect(telemetryLogger.logUsage).toHaveBeenCalledWith('activated');
   });
 
-  it('does not register the provider on non-Windows platforms', async () => {
+  test('does not register the provider on non-Windows platforms', async () => {
     (env as { isWindows: boolean }).isWindows = false;
     const extension = new WslcExtension(extensionContext);
 
     await extension.activate();
 
-    expect(WslcProviderManager.prototype.registerContainerProvider).not.toHaveBeenCalled();
+    expect(registerContainerProviderMock).not.toHaveBeenCalled();
+    expect(telemetryLogger.logError).toHaveBeenCalledWith('invalidPlatform');
   });
 
-  it('delegates cleanup', async () => {
+  test('deactivates the provider manager when the extension is deactivated', async () => {
     const extension = new WslcExtension(extensionContext);
     await extension.activate();
 
     await extension.deactivate();
 
-    expect(WslcProviderManager.prototype.deactivate).toHaveBeenCalledOnce();
+    expect(deactivateProviderManagerMock).toHaveBeenCalledOnce();
   });
 });
