@@ -16,12 +16,43 @@
  * SPDX-License-Identifier: Apache-2.0
  ***********************************************************************/
 
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, test, vi } from 'vitest';
 import { bridgeConfiguration } from './bridge-config';
 
-describe('bridgeConfiguration', () => {
-  it('uses the same pipe for bridge arguments and provider endpoint', () => {
-    expect(bridgeConfiguration.startupArguments).toEqual(['--pipe', bridgeConfiguration.pipeName]);
+beforeEach(() => {
+  vi.resetAllMocks();
+});
+
+describe('bridgeConfiguration artifact metadata', () => {
+  test('defines the artifact repository, archive, and binary names', () => {
+    expect(bridgeConfiguration.repository).toBe('https://github.com/l0rd/wslc-proxy');
+    expect(bridgeConfiguration.assetName).toBe('wslc-proxy-windows-amd64-linux-amd64.zip');
+    expect(bridgeConfiguration.executableName).toBe('socktainer.exe');
+    expect(bridgeConfiguration.relayName).toBe('docker-relay');
+  });
+});
+
+describe('bridgeConfiguration bridge endpoints', () => {
+  test('defines the Socktainer TCP endpoint', () => {
+    expect(bridgeConfiguration.host).toBe('localhost');
+    expect(bridgeConfiguration.port).toBe(2375);
+  });
+
+  test('defines the WSLC named pipe', () => {
+    expect(bridgeConfiguration.pipeName).toBe(String.raw`\\.\pipe\wslc_engine`);
+  });
+});
+
+describe('bridgeConfiguration monitoring and timeout settings', () => {
+  test('defines the operational timeouts and retry limit', () => {
+    expect(bridgeConfiguration.startupTimeoutMs).toBe(180_000);
+    expect(bridgeConfiguration.requestTimeoutMs).toBe(5_000);
+    expect(bridgeConfiguration.readinessPollIntervalMs).toBe(250);
+    expect(bridgeConfiguration.shutdownTimeoutMs).toBe(10_000);
+    expect(bridgeConfiguration.maxConsecutiveStartupFailures).toBe(3);
+  });
+
+  test('refreshes provider status every 30 seconds', () => {
     expect(bridgeConfiguration.refreshIntervalMs).toBe(30_000);
   });
 });

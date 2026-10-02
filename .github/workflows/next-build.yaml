@@ -8,8 +8,15 @@ permissions:
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
+    inputs:
+      proxy_version:
+        description: Published wslc-proxy release version
+        required: true
+        type: string
+      proxy_sha256:
+        description: SHA-256 of the published proxy ZIP asset
+        required: true
+        type: string
 
 jobs:
   build:
@@ -32,3 +39,8 @@ jobs:
           containerfiles: build/Containerfile
           context: .
           oci: true
+          build-args: |
+            WSLC_PROXY_VERSION=${{ inputs.proxy_version }}
+            WSLC_PROXY_SHA256=${{ inputs.proxy_sha256 }}
+            WSLC_PROXY_BIN_DIR=
+            WSLC_PROXY_ARCHIVE=

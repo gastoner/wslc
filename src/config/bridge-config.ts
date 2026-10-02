@@ -22,20 +22,34 @@ export interface BridgeConfiguration {
   assetName: string | undefined;
   sha256: string | undefined;
   executableName: string;
+  relayName: string;
+  host: string;
+  port: number;
   pipeName: string;
-  startupArguments: readonly string[];
+  startupTimeoutMs: number;
+  requestTimeoutMs: number;
+  readinessPollIntervalMs: number;
+  shutdownTimeoutMs: number;
+  maxConsecutiveStartupFailures: number;
   refreshIntervalMs: number;
 }
 
 const pipeName = String.raw`\\.\pipe\wslc_engine`;
 
 export const bridgeConfiguration: BridgeConfiguration = {
-  repository: 'https://github.com/dgolovin/extension-wsl-container',
+  repository: 'https://github.com/l0rd/wslc-proxy',
   version: undefined,
-  assetName: undefined,
+  assetName: 'wslc-proxy-windows-amd64-linux-amd64.zip',
   sha256: undefined,
-  executableName: 'wslc-bridge.exe',
+  executableName: 'socktainer.exe',
+  relayName: 'docker-relay',
+  host: 'localhost',
+  port: 2375,
   pipeName,
-  startupArguments: ['--pipe', pipeName],
+  startupTimeoutMs: 180_000,
+  requestTimeoutMs: 5_000,
+  readinessPollIntervalMs: 250,
+  shutdownTimeoutMs: 10_000,
+  maxConsecutiveStartupFailures: 3,
   refreshIntervalMs: 30_000,
 };
