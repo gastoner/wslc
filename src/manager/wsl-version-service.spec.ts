@@ -16,28 +16,41 @@
  * SPDX-License-Identifier: Apache-2.0
  ***********************************************************************/
 
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, test, vi } from 'vitest';
 import { WslVersionService } from './wsl-version-service';
 
-describe('WslVersionService', () => {
-  const service = new WslVersionService();
+const service = new WslVersionService();
 
-  it('parses the WSL version line', () => {
+beforeEach(() => {
+  vi.resetAllMocks();
+});
+
+describe('WslVersionService.parseWslVersion', () => {
+  test('parses the WSL version line', () => {
     expect(service.parseWslVersion('WSL version: 2.9.3.0\nKernel version: 6.6.')).toBe('2.9.3.0');
   });
 
-  it('returns undefined for unrecognized output', () => {
+  test('returns undefined for unrecognized output', () => {
     expect(service.parseWslVersion('Windows version: 11.0.1')).toBeUndefined();
   });
+});
 
-  it('accepts the minimum and newer WSL versions', () => {
+describe('WslVersionService.isSupportedWslVersion', () => {
+  test('uses 2.9.3 as the minimum supported WSL version', () => {
     expect(service.minimumVersion).toBe('2.9.3');
-    expect(service.isSupportedWslVersion('2.9.3')).toBe(true);
-    expect(service.isSupportedWslVersion('2.10.0.0')).toBe(true);
   });
 
-  it('rejects older and malformed WSL versions', () => {
-    expect(service.isSupportedWslVersion('2.9.2.0')).toBe(false);
-    expect(service.isSupportedWslVersion('not-a-version')).toBe(false);
+  test.each([
+    ['2.9.3', 'the minimum version'],
+    ['2.10.0.0', 'a newer version'],
+  ])('accepts %s as %s', (version) => {
+    expect(service.isSupportedWslVersion(version)).toBeTruthy();
+  });
+
+  test.each([
+    ['2.9.2.0', 'an older version'],
+    ['not-a-version', 'malformed input'],
+  ])('rejects %s as %s', (version) => {
+    expect(service.isSupportedWslVersion(version)).toBeFalsy();
   });
 });

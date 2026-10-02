@@ -1,4 +1,7 @@
 node_modules/
 dist/
+/build/proxy-bin/
+/build/proxy-binaries/
+/build/proxy-artifacts.zip
 coverage/
 *.log

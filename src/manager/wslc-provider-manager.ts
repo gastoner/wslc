@@ -16,8 +16,8 @@
  * SPDX-License-Identifier: Apache-2.0
  ***********************************************************************/
 
-import { spawn, type ChildProcess } from 'node:child_process';
-import { createServer, type Server, type Socket } from 'node:net';
+import { request as httpRequest } from 'node:http';
+import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { inject, injectable } from 'inversify';
 import {
   type ContainerProviderConnection,
@@ -33,10 +33,10 @@ import {
 } from '@podman-desktop/api';
 import { bridgeConfiguration } from '../config/bridge-config';
 import { ExtensionContextSymbol, TelemetryLoggerSymbol } from '../inject/symbol';
+import { WslcProxyManager } from './wslc-proxy-manager';
 import { WslVersionService } from './wsl-version-service';
 
 const WSLC_EXECUTABLE = 'wslc.exe';
-const WSLC_DOCKER_DIAL_ARGUMENTS = ['system', 'session', 'run', 'docker', 'system', 'dial-stdio'];
 
 @injectable()
 export class WslcProviderManager {
@@ -51,10 +51,13 @@ export class WslcProviderManager {
   @inject(WslVersionService)
   private readonly wslVersionService: WslVersionService;
 
+  @inject(WslcProxyManager)
+  private readonly wslcProxyManager: WslcProxyManager;
+
   #wslcProvider: Provider | undefined;
   #bridgeServer: Server | undefined;
-  #bridgeProcesses = new Set<ChildProcess>();
   #bridgeSockets = new Set<Socket>();
+  #proxySockets = new Set<Socket>();
   #connectionDisposable: Disposable | undefined;
   #installationDisposable: Disposable | undefined;
   #updateDisposable: Disposable | undefined;
@@ -62,6 +65,8 @@ export class WslcProviderManager {
   #refreshTimer: NodeJS.Timeout | undefined;
   #refreshPromise: Promise<void> | undefined;
   #stopMonitoringStatus = false;
+  #abortController: AbortController | undefined;
+  #proxyStartupFailures = 0;
 
   async registerContainerProvider(): Promise<void> {
     if (this.#wslcProvider) {
@@ -69,6 +74,8 @@ export class WslcProviderManager {
     }
 
     this.#stopMonitoringStatus = false;
+    this.#abortController = new AbortController();
+    this.#proxyStartupFailures = 0;
     const wslcProvider = provider.createProvider({
       name: 'WSL Containers',
       id: WslcProviderManager.PROVIDER_ID,
@@ -148,17 +155,33 @@ export class WslcProviderManager {
       return;
     }
 
-    if (this.#connectionDisposable) {
-      console.log('WSL Containers provider connection already started');
+    if (this.#connectionDisposable && this.wslcProxyManager.isReady()) {
+      try {
+        await this.pingNamedPipe();
+        wslcProvider.updateStatus('ready');
+        return;
+      } catch (error: unknown) {
+        await this.cleanupConnection();
+        await this.stopBridge();
+        console.warn('WSL Containers connection health check failed', error);
+      }
+    }
+
+    if (this.#proxyStartupFailures >= bridgeConfiguration.maxConsecutiveStartupFailures) {
+      wslcProvider.updateStatus('error');
       return;
     }
 
-    wslcProvider.updateStatus('ready');
     try {
       await this.ensureBridge();
+      this.#proxyStartupFailures = 0;
+      if (!this.#stopMonitoringStatus) {
+        wslcProvider.updateStatus('ready');
+      }
     } catch (error: unknown) {
       await this.cleanupConnection();
       await this.stopBridge();
+      this.#proxyStartupFailures += 1;
       if (!this.#stopMonitoringStatus) {
         wslcProvider.updateStatus('error');
         this.telemetryLogger.logError('bridgeStartupFailed');
@@ -222,6 +245,7 @@ export class WslcProviderManager {
 
   async deactivate(): Promise<void> {
     this.#stopMonitoringStatus = true;
+    this.#abortController?.abort();
     if (this.#refreshTimer) {
       clearTimeout(this.#refreshTimer);
       this.#refreshTimer = undefined;
@@ -232,6 +256,7 @@ export class WslcProviderManager {
     await this.cleanupConnection();
     await this.stopBridge();
     this.#wslcProvider = undefined;
+    this.#abortController = undefined;
   }
 
   private registerUpdate(): void {
@@ -256,7 +281,7 @@ export class WslcProviderManager {
 
     const installation: ProviderInstallation = {
       install: async (logger: Logger): Promise<void> => {
-        await this.updateWsl(logger, 'Installing WSL Containers prerequisites with wsl --update --pre-release');
+        await this.updateWsl(logger, 'Installing WSL Containers prerequisites with wsl --update');
       },
     };
     this.#installationDisposable = this.#wslcProvider.registerInstallation(installation);
@@ -265,7 +290,7 @@ export class WslcProviderManager {
 
   private async updateWsl(logger: Logger, message: string): Promise<void> {
     logger.log(message);
-    await podmanProcess.exec('wsl', ['--update', '--pre-release'], { encoding: 'utf16le' });
+    await podmanProcess.exec('wsl', ['--update'], { encoding: 'utf16le' });
     await this.#refreshPromise;
     await this.refresh();
   }
@@ -295,6 +320,13 @@ export class WslcProviderManager {
   }
 
   private async ensureBridge(): Promise<void> {
+    const abortController = this.#abortController;
+    if (!abortController || abortController.signal.aborted) {
+      throw new Error('WSL Containers proxy startup was cancelled');
+    }
+
+    await this.wslcProxyManager.start(abortController.signal, (error) => this.handleProxyExit(error));
+
     if (!this.#bridgeServer?.listening) {
       const bridgeServer = createServer((socket) => this.proxyWslcSocket(bridgeServer, socket));
       this.#bridgeServer = bridgeServer;
@@ -322,6 +354,7 @@ export class WslcProviderManager {
       this.telemetryLogger.logUsage('bridgeStarted');
     }
 
+    await this.pingNamedPipe();
     await this.registerConnection();
   }
 
@@ -331,43 +364,28 @@ export class WslcProviderManager {
       return;
     }
 
-    const childProcess = spawn(WSLC_EXECUTABLE, WSLC_DOCKER_DIAL_ARGUMENTS, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true,
-    });
-    if (!childProcess.stdin || !childProcess.stdout) {
-      childProcess.kill();
-      socket.destroy();
-      return;
-    }
-
-    this.#bridgeProcesses.add(childProcess);
+    const proxySocket = createConnection({ host: bridgeConfiguration.host, port: bridgeConfiguration.port });
     this.#bridgeSockets.add(socket);
-    socket.pipe(childProcess.stdin);
-    childProcess.stdout.pipe(socket);
+    this.#proxySockets.add(proxySocket);
+    socket.pipe(proxySocket);
+    proxySocket.pipe(socket);
 
-    childProcess.stderr?.on('data', (data) => {
-      console.error(`WSLC bridge error: ${String(data).trim()}`);
-    });
-    childProcess.once('error', (error: Error) => {
-      console.error('WSL Containers bridge process error', error);
-      socket.destroy();
-      this.#bridgeProcesses.delete(childProcess);
-    });
-    childProcess.once('close', () => {
-      this.#bridgeProcesses.delete(childProcess);
-      socket.destroy();
-    });
-    socket.once('error', (error: Error) => {
-      console.error('WSL Containers bridge socket error', error);
-      childProcess.kill();
-    });
-    socket.once('close', () => {
+    const closePair = (): void => {
       this.#bridgeSockets.delete(socket);
-      if (!childProcess.killed && typeof childProcess.exitCode !== 'number') {
-        childProcess.kill();
-      }
+      this.#proxySockets.delete(proxySocket);
+      socket.destroy();
+      proxySocket.destroy();
+    };
+    socket.once('error', (error: Error) => {
+      console.error('WSL Containers named-pipe client error', error);
+      closePair();
     });
+    proxySocket.once('error', (error: Error) => {
+      console.error('WSL Containers TCP proxy connection error', error);
+      closePair();
+    });
+    socket.once('close', closePair);
+    proxySocket.once('close', closePair);
   }
 
   private handleBridgeServerError(bridgeServer: Server, error: Error): void {
@@ -382,6 +400,53 @@ export class WslcProviderManager {
     if (!this.#stopMonitoringStatus) {
       this.#wslcProvider?.updateStatus('installed');
     }
+  }
+
+  private handleProxyExit(error: Error): void {
+    void (async () => {
+      await this.cleanupConnection();
+      await this.stopBridge();
+      this.telemetryLogger.logUsage('bridgeExited');
+      this.#proxyStartupFailures += 1;
+      if (!this.#stopMonitoringStatus) {
+        this.#wslcProvider?.updateStatus(
+          this.#proxyStartupFailures >= bridgeConfiguration.maxConsecutiveStartupFailures ? 'error' : 'installed',
+        );
+        console.error('WSL Containers Socktainer process exited unexpectedly', error);
+      }
+    })();
+  }
+
+  private async pingNamedPipe(): Promise<void> {
+    await new Promise<void>((resolvePing, rejectPing) => {
+      const request = httpRequest(
+        {
+          socketPath: bridgeConfiguration.pipeName,
+          path: '/_ping',
+          method: 'GET',
+        },
+        (response) => {
+          let body = '';
+          response.setEncoding('utf8');
+          response.on('data', (chunk: string) => {
+            body += chunk;
+          });
+          response.once('end', () => {
+            if (response.statusCode === 200 && body.trim() === 'OK') {
+              resolvePing();
+              return;
+            }
+            rejectPing(new Error('WSL Containers named-pipe Docker API ping failed'));
+          });
+        },
+      );
+
+      request.setTimeout(bridgeConfiguration.requestTimeoutMs, () => {
+        request.destroy(new Error('WSL Containers named-pipe Docker API ping timed out'));
+      });
+      request.once('error', rejectPing);
+      request.end();
+    });
   }
 
   private async registerConnection(): Promise<void> {
@@ -412,17 +477,17 @@ export class WslcProviderManager {
     }
     this.#bridgeSockets.clear();
 
-    for (const childProcess of this.#bridgeProcesses) {
-      if (!childProcess.killed && typeof childProcess.exitCode !== 'number') {
-        childProcess.kill();
-      }
+    for (const socket of this.#proxySockets) {
+      socket.destroy();
     }
-    this.#bridgeProcesses.clear();
+    this.#proxySockets.clear();
 
     if (bridgeServer?.listening) {
       await new Promise<void>((resolveClose) => {
         bridgeServer.close(() => resolveClose());
       });
     }
+
+    await this.wslcProxyManager.stop();
   }
 }

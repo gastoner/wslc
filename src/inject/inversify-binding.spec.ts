@@ -17,7 +17,7 @@
  ***********************************************************************/
 
 import type { ExtensionContext, TelemetryLogger } from '@podman-desktop/api';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { InversifyBinding } from './inversify-binding';
 import { ExtensionContextSymbol, TelemetryLoggerSymbol } from './symbol';
 import { WslVersionService } from '../manager/wsl-version-service';
@@ -29,15 +29,19 @@ const telemetryLogger = {
   logUsage: vi.fn(),
 } as unknown as TelemetryLogger;
 
+let binding: InversifyBinding;
+
+beforeEach(() => {
+  vi.resetAllMocks();
+  binding = new InversifyBinding(extensionContext, telemetryLogger);
+});
+
+afterEach(async () => {
+  await binding.dispose();
+});
+
 describe('InversifyBinding', () => {
-  let binding: InversifyBinding;
-
-  beforeEach(() => {
-    vi.resetAllMocks();
-    binding = new InversifyBinding(extensionContext, telemetryLogger);
-  });
-
-  it('loads the manager and its dependencies', async () => {
+  test('loads the manager and its dependencies', async () => {
     const container = await binding.initBindings();
 
     expect(container.get(ExtensionContextSymbol)).toBe(extensionContext);
@@ -46,12 +50,21 @@ describe('InversifyBinding', () => {
     expect(container.get(WslcProviderManager)).toBeInstanceOf(WslcProviderManager);
   });
 
-  it('disposes the container safely', async () => {
+  test('removes container bindings when disposed', async () => {
+    const container = await binding.initBindings();
+
+    await binding.dispose();
+
+    expect(container.isBound(ExtensionContextSymbol)).toBeFalsy();
+    expect(container.isBound(TelemetryLoggerSymbol)).toBeFalsy();
+    expect(container.isBound(WslVersionService)).toBeFalsy();
+    expect(container.isBound(WslcProviderManager)).toBeFalsy();
+  });
+
+  test('resolves safely when disposed more than once', async () => {
     await binding.initBindings();
-
-    await binding.dispose();
     await binding.dispose();
 
-    expect(true).toBe(true);
+    await expect(binding.dispose()).resolves.toBeUndefined();
   });
 });

@@ -1,49 +1,90 @@
 # WSL Containers Extension
 
-This Podman Desktop extension provides a Windows container provider for Microsoft's WSL Containers (WSLC) runtime.
+This Podman Desktop extension exposes Microsoft's WSL Containers (WSLC) runtime through a Docker-compatible container
+provider on Windows.
 
-WSLC is currently a public preview and requires a recent WSL prerelease. Install or update it from an elevated
-PowerShell terminal:
+## Prerequisites
+
+Install or update WSL from an elevated PowerShell terminal:
 
 ```powershell
-wsl --update --pre-release
+wsl --update
 ```
 
-Open a new terminal after the update and verify the runtime:
+Open a new terminal and verify WSLC:
 
 ```powershell
 wslc version
 ```
 
-The extension is intended for Windows 10 and Windows 11. Windows Server 2025 has community validation; Windows
-Server 2022 is not currently supported.
-
-The extension checks `wslc.exe version`, then checks the WSL package version. If `wslc.exe` is unavailable, the provider
-is marked not installed and exposes Podman Desktop's Install action, which runs `wsl --update --pre-release` and
-refreshes provider detection. If WSLC is installed but WSL is older than `2.9.3`, the provider remains installed, does
-not start the bridge, and exposes an Update action that runs the same command. If the WSL version cannot be detected,
-the provider remains installed without registering a connection or update action.
-
-After the version check passes, the extension runs `wslc.exe container list` to verify the runtime before starting the
-named-pipe endpoint. This documented command can initialize a WSLC session. The extension listens on
-`\\.\pipe\wslc_engine` and starts `wslc.exe system session run docker system dial-stdio` for each Docker API client.
+The extension is intended for Windows 10 and Windows 11. Windows Server 2025 has community validation; Windows Server
+2022 is not currently supported. The required WSL package version is 2.9.3 or newer.
 
 ## Architecture
 
-WSLC's Docker daemon runs inside the WSL guest and is not exposed directly to the Windows host. The extension provides a
-Windows named pipe and forwards each Docker API stream through `wslc.exe system session run docker system dial-stdio`.
-This allows Podman Desktop to use the WSLC Docker API without a separately packaged bridge executable.
+The extension creates the Windows named pipe `\\.\pipe\wslc_engine` and forwards its client streams to Socktainer at
+`localhost:2375`. Socktainer is used as it exists in the bare `wslc-proxy` repository: it forwards Docker API streams to
+the guest Docker daemon by running `wslc system session run /tmp/docker-relay`.
+
+The extension only manages the proxy process and adapts Podman Desktop's named-pipe connection to Socktainer's TCP
+listener. Docker API requests are forwarded transparently to the guest daemon; the proxy does not translate container
+create/start or network-create requests into WSLC CLI commands, and it does not overlay native WSLC port data into
+inspect responses. The separate `wslc` CLI remains available in PowerShell.
+
+## Proxy artifacts
+
+For development, the extension consumes externally built `socktainer.exe` and `docker-relay` files from a local
+directory. Production packaging consumes a versioned ZIP containing those binaries and `manifest.json`, verified by
+SHA-256. The supported pair is Windows/amd64 plus Linux/amd64.
+
+For local development, build the two binaries from the unmodified `wslc-proxy` source into a temporary directory. Run
+these commands in PowerShell from the extension repository:
+
+```powershell
+$proxyBin = "$env:TEMP\wslc-proxy-bin"
+New-Item -ItemType Directory -Force $proxyBin | Out-Null
+Push-Location ..\wslc-proxy
+$env:GOOS = 'windows'
+$env:GOARCH = 'amd64'
+$env:CGO_ENABLED = '0'
+go build -o "$proxyBin\socktainer.exe" ./cmd/socktainer
+$env:GOOS = 'linux'
+go build -o "$proxyBin\docker-relay" ./cmd/relay
+Pop-Location
+$env:WSLC_PROXY_BIN_DIR = $proxyBin
+pnpm download-dependencies
+```
+
+This only builds the existing proxy source; the extension downloader verifies the binaries are PE Windows/amd64 and ELF
+Linux/amd64 before copying them into `dist/bin/win32-x64/`. The extension repository does not compile or alter
+`wslc-proxy`.
+
+To build a local OCI image, stage those externally built binaries in the context and set the build argument:
+
+```powershell
+New-Item -ItemType Directory -Force build\proxy-binaries | Out-Null
+Copy-Item "$proxyBin\*" build\proxy-binaries\
+podman build -f build/Containerfile -t wslc-local `
+  --build-arg WSLC_PROXY_BIN_DIR=build/proxy-binaries .
+```
+
+For production packaging, `pnpm download-dependencies` requires a published proxy release version and its SHA-256. The
+bare `wslc-proxy` repository currently has no such release asset; the manual `next-build` workflow requires those values
+and does not build from a moving proxy source branch.
 
 ## Limitations
 
-Version 1 does not support Compose, Docker-in-Docker, mounting the host Docker socket, privileged containers, restart
-policies, `host.docker.internal`, `--add-host`, or interactive exec.
+Because Docker API writes go directly to the guest engine, this integration does not provide the WSLC-native Windows
+port-relay and host-bind behavior requested by issue #1113. Compose, Docker-in-Docker, privileged containers, host socket
+mounting, interactive attach/exec, `host.docker.internal`, and `--add-host` are also not provided by this integration.
 
-## Development
+## Development checks
 
 ```bash
 pnpm install --frozen-lockfile
 pnpm typecheck
+pnpm lint:check
+pnpm format:check
 pnpm test
 pnpm build
 ```

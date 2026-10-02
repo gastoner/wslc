@@ -22,7 +22,15 @@ ENV CI=true
 RUN npm i -g corepack@0.34.5 && corepack enable
 COPY --chown=1001:1001 . .
 RUN pnpm install --frozen-lockfile
-RUN pnpm download-dependencies --optional
+ARG WSLC_PROXY_VERSION
+ARG WSLC_PROXY_SHA256
+ARG WSLC_PROXY_ARCHIVE
+ARG WSLC_PROXY_BIN_DIR
+ENV WSLC_PROXY_VERSION=${WSLC_PROXY_VERSION} \
+    WSLC_PROXY_SHA256=${WSLC_PROXY_SHA256} \
+    WSLC_PROXY_ARCHIVE=${WSLC_PROXY_ARCHIVE} \
+    WSLC_PROXY_BIN_DIR=${WSLC_PROXY_BIN_DIR}
+RUN pnpm download-dependencies
 RUN pnpm build
 
 FROM scratch
