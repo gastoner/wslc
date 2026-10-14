@@ -43,14 +43,14 @@ describe('WslVersionService.isSupportedWslVersion', () => {
   test.each([
     ['2.9.3', 'the minimum version'],
     ['2.10.0.0', 'a newer version'],
-  ])('accepts %s as %s', (version) => {
+  ])('accepts %s as %s', version => {
     expect(service.isSupportedWslVersion(version)).toBeTruthy();
   });
 
   test.each([
     ['2.9.2.0', 'an older version'],
     ['not-a-version', 'malformed input'],
-  ])('rejects %s as %s', (version) => {
+  ])('rejects %s as %s', version => {
     expect(service.isSupportedWslVersion(version)).toBeFalsy();
   });
 });
