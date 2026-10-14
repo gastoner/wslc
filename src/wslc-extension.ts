@@ -27,16 +27,38 @@ export class WslcExtension {
   #inversifyBinding: InversifyBinding | undefined;
   #container: Container | undefined;
   #telemetryLogger: TelemetryLogger | undefined;
+  #activationPromise: Promise<void> | undefined;
+  #deferredActivationPromise: Promise<void> | undefined;
+  #cleanupPromise: Promise<void> | undefined;
+  #deactivationPromise: Promise<void> | undefined;
+  #deactivationRequested = false;
 
   constructor(extensionContext: ExtensionContext) {
     this.#extensionContext = extensionContext;
   }
 
   async activate(): Promise<void> {
-    if (this.#providerManager) {
+    if (this.#activationPromise) {
+      return this.#activationPromise;
+    }
+
+    if (this.#deactivationRequested) {
       return;
     }
 
+    if (!env.isWindows) {
+      const telemetryLogger = env.createTelemetryLogger();
+      telemetryLogger.logError('invalidPlatform');
+      console.warn('WSL Containers extension not started: can only be activated on Windows');
+      this.#activationPromise = Promise.resolve();
+      return;
+    }
+
+    this.#activationPromise = this.activateOnWindows();
+    return this.#activationPromise;
+  }
+
+  private async activateOnWindows(): Promise<void> {
     const telemetryLogger = env.createTelemetryLogger();
     this.#telemetryLogger = telemetryLogger;
     this.#inversifyBinding = new InversifyBinding(this.#extensionContext, telemetryLogger);
@@ -47,37 +69,83 @@ export class WslcExtension {
       this.#providerManager = providerManager;
     } catch (error: unknown) {
       console.error('WSL Containers extension activation failed', error);
-      await this.#providerManager?.deactivate();
-      await this.#inversifyBinding.dispose();
-      this.#providerManager = undefined;
-      this.#container = undefined;
+      try {
+        await this.cleanup();
+      } catch (cleanupError: unknown) {
+        console.error('WSL Containers extension activation cleanup failed', cleanupError);
+      }
       throw error;
     }
 
-    this.deferActivate().catch((error: unknown) => {
+    if (this.#deactivationRequested) {
+      return;
+    }
+
+    this.#deferredActivationPromise = this.deferActivate().catch((error: unknown) => {
       console.error('error in deferActivate', error);
     });
   }
 
   async deactivate(): Promise<void> {
+    this.#deactivationRequested = true;
+    if (!this.#deactivationPromise) {
+      this.#deactivationPromise = this.deactivateAndCleanup();
+    }
+    return this.#deactivationPromise;
+  }
+
+  private async deactivateAndCleanup(): Promise<void> {
+    try {
+      await this.#activationPromise;
+    } catch {
+      // Activation reports its own failure to the caller; deactivation still cleans up.
+    }
+
+    try {
+      await this.#deferredActivationPromise;
+    } catch {
+      // Deferred activation errors are logged by activateOnWindows.
+    }
+
+    await this.cleanup();
+  }
+
+  private cleanup(): Promise<void> {
+    if (this.#cleanupPromise) {
+      return this.#cleanupPromise;
+    }
+
     const providerManager = this.#providerManager;
+    const inversifyBinding = this.#inversifyBinding;
     this.#providerManager = undefined;
-    await providerManager?.deactivate();
-    await this.#inversifyBinding?.dispose();
     this.#inversifyBinding = undefined;
     this.#container = undefined;
-    this.#telemetryLogger = undefined;
+
+    const cleanupPromise = Promise.resolve().then(async () => {
+      try {
+        await providerManager?.deactivate();
+      } finally {
+        try {
+          await inversifyBinding?.dispose();
+        } finally {
+          this.#telemetryLogger = undefined;
+        }
+      }
+    });
+    this.#cleanupPromise = cleanupPromise;
+    return cleanupPromise;
   }
 
   protected async deferActivate(): Promise<void> {
-    if (!env.isWindows) {
-      this.#telemetryLogger?.logError('invalidPlatform');
-      console.warn('WSL Containers extension not started: can only be activated on Windows');
+    if (this.#deactivationRequested) {
       return;
     }
 
     console.log('WSL Containers extension activated on Windows');
     this.#telemetryLogger?.logUsage('activated');
+    if (this.#deactivationRequested) {
+      return;
+    }
     await this.#providerManager?.registerContainerProvider();
   }
 

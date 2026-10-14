@@ -17,233 +17,352 @@
  ***********************************************************************/
 
 import { createHash } from 'node:crypto';
-import { access, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { basename, dirname, join, resolve } from 'node:path';
+import type { Stats } from 'node:fs';
+import { mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import AdmZip from 'adm-zip';
-import { bridgeConfiguration } from '../src/config/bridge-config';
+import {
+  BRIDGE_ARTIFACT_SHA256,
+  type BridgeArchitecture,
+  type BridgeArtifactPins,
+} from '../src/config/bridge-artifacts';
 
-export interface ProxyArtifactManifest {
-  formatVersion: 1;
+export interface BridgeManifestArtifact {
+  os: 'windows';
+  arch: BridgeArchitecture;
+  file: string;
+  sha256: string;
+}
+
+export interface BridgeArtifactManifest {
+  schemaVersion: 1;
   version: string;
-  sourceRevision: string;
-  hostArchitecture: 'windows/amd64';
-  guestArchitecture: 'linux/amd64';
+  commit: string;
+  buildDate: string;
+  artifacts: BridgeManifestArtifact[];
 }
 
-const MAX_ARCHIVE_SIZE = 512 * 1024 * 1024;
 const MAX_EXECUTABLE_SIZE = 128 * 1024 * 1024;
-const MAX_RELAY_SIZE = 128 * 1024 * 1024;
 const MAX_MANIFEST_SIZE = 64 * 1024;
+const MAX_CHECKSUMS_SIZE = 4 * 1024;
 
-export class Downloader {
-  async downloadAndExtract(): Promise<void> {
-    const localArchive = process.env.WSLC_PROXY_ARCHIVE;
-    const localBinaryDirectory = process.env.WSLC_PROXY_BIN_DIR;
-    const version = process.env.WSLC_PROXY_VERSION ?? bridgeConfiguration.version;
-    const expectedSha256 = process.env.WSLC_PROXY_SHA256 ?? bridgeConfiguration.sha256;
-    const assetName = bridgeConfiguration.assetName;
+const ARTIFACTS: Readonly<Record<BridgeArchitecture, { file: string; outputDirectory: string; machine: number }>> = {
+  amd64: { file: 'wslc-bridge-windows-amd64.exe', outputDirectory: 'win32-x64', machine: 0x8664 },
+  arm64: { file: 'wslc-bridge-windows-arm64.exe', outputDirectory: 'win32-arm64', machine: 0xaa64 },
+};
 
-    if (!assetName) {
-      throw new Error('WSLC proxy asset name is not configured');
+export async function resolveBridgeArtifactDirectory(
+  extensionRoot: string,
+  environmentDirectory: string | undefined = process.env.WSLC_BRIDGE_ARTIFACT_DIR,
+): Promise<string> {
+  if (environmentDirectory !== undefined) {
+    if (!environmentDirectory.trim()) {
+      throw new Error('WSLC_BRIDGE_ARTIFACT_DIR must name a local artifact directory');
     }
-    const outputDirectory = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'dist', 'bin', 'win32-x64');
-    if (localBinaryDirectory) {
-      await installLocalProxyPair(resolve(localBinaryDirectory), outputDirectory);
-      return;
-    }
-    if (localArchive) {
-      if (!expectedSha256 || !/^[a-f\d]{64}$/i.test(expectedSha256)) {
-        throw new Error('WSLC_PROXY_SHA256 must provide the local proxy ZIP SHA-256');
-      }
-      const localPath = resolve(localArchive);
-      const file = await stat(localPath);
-      if (file.size > MAX_ARCHIVE_SIZE) {
-        throw new Error('Socktainer release archive exceeds 512 MiB');
-      }
-      await installProxyArchive(await readFile(localPath), expectedSha256, outputDirectory, version);
-      return;
-    }
-
-    if (version && expectedSha256) {
-      if (!/^[a-f\d]{64}$/i.test(expectedSha256)) {
-        throw new Error('WSLC_PROXY_SHA256 must contain exactly 64 hexadecimal characters');
-      }
-      const archive = await this.downloadRelease(version, assetName);
-      await installProxyArchive(archive, expectedSha256, outputDirectory, version);
-      return;
-    }
-
-    const siblingProxyDirectory = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'wslc-proxy');
-    await installLocalProxyPair(siblingProxyDirectory, outputDirectory);
+    return resolve(environmentDirectory);
   }
 
-  private async downloadRelease(version: string, assetName: string): Promise<Buffer> {
-    const url = `${bridgeConfiguration.repository}/releases/download/${encodeURIComponent(version)}/${assetName}`;
-    const response = await fetch(url);
-    if (!response.ok || !response.body) {
-      throw new Error(`Failed to download pinned Socktainer asset (${response.status})`);
+  const buildArtifactDirectory = join(extensionRoot, 'build', 'bridge-artifacts');
+  if (await isRegularFile(join(buildArtifactDirectory, 'bridge-manifest.json'))) {
+    return buildArtifactDirectory;
+  }
+
+  return resolve(extensionRoot, '..', 'wslc-bridge', 'dist');
+}
+
+export async function stageBridgeArtifacts(
+  sourceDirectory: string,
+  outputBinDirectory: string,
+  pins: BridgeArtifactPins = BRIDGE_ARTIFACT_SHA256,
+): Promise<void> {
+  const manifestContents = await readBoundedFile(
+    join(sourceDirectory, 'bridge-manifest.json'),
+    MAX_MANIFEST_SIZE,
+    'bridge-manifest.json',
+  );
+  const checksumsContents = await readBoundedFile(
+    join(sourceDirectory, 'checksums.txt'),
+    MAX_CHECKSUMS_SIZE,
+    'checksums.txt',
+  );
+  const manifest = parseManifest(manifestContents);
+  validateManifest(manifest);
+  const checksums = parseChecksums(checksumsContents);
+  const artifacts = new Map<BridgeArchitecture, Buffer>();
+
+  for (const architecture of ['amd64', 'arm64'] as const) {
+    const artifact = manifest.artifacts.find((candidate) => candidate.arch === architecture);
+    const expectedArtifact = ARTIFACTS[architecture];
+    if (!artifact) {
+      throw new Error(`bridge-manifest.json is missing the Windows/${architecture} artifact`);
     }
-    const reader = response.body.getReader();
-    const chunks: Uint8Array[] = [];
-    let totalLength = 0;
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-      totalLength += value.byteLength;
-      if (totalLength > MAX_ARCHIVE_SIZE) {
-        await reader.cancel();
-        throw new Error('Socktainer release archive exceeds 512 MiB');
-      }
-      chunks.push(value);
+
+    const checksum = checksums.get(expectedArtifact.file);
+    if (!checksum) {
+      throw new Error(`checksums.txt is missing ${expectedArtifact.file}`);
     }
-    return Buffer.concat(chunks, totalLength);
+    const pinnedChecksum = pins[architecture];
+    if (!/^[a-f\d]{64}$/i.test(pinnedChecksum)) {
+      throw new Error(`The pinned Windows/${architecture} SHA-256 is invalid`);
+    }
+    if (artifact.sha256 !== checksum) {
+      throw new Error(`Manifest/checksum mismatch for ${expectedArtifact.file}`);
+    }
+    if (artifact.sha256 !== pinnedChecksum.toLowerCase()) {
+      throw new Error(`SHA-256 pin mismatch for Windows/${architecture}: expected ${pinnedChecksum}`);
+    }
+
+    const executable = await readBoundedFile(
+      join(sourceDirectory, expectedArtifact.file),
+      MAX_EXECUTABLE_SIZE,
+      expectedArtifact.file,
+    );
+    const actualChecksum = createHash('sha256').update(executable).digest('hex');
+    if (actualChecksum !== artifact.sha256) {
+      throw new Error(`Executable checksum mismatch for ${expectedArtifact.file}`);
+    }
+    if (!isWindowsExecutableForMachine(executable, expectedArtifact.machine)) {
+      throw new Error(`${expectedArtifact.file} is not a valid Windows PE executable for ${architecture}`);
+    }
+    artifacts.set(architecture, executable);
+  }
+
+  await replaceStagedArtifacts(outputBinDirectory, artifacts, manifestContents, checksumsContents);
+}
+
+function parseManifest(contents: Buffer): BridgeArtifactManifest {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(contents.toString('utf8')) as unknown;
+  } catch {
+    throw new Error('bridge-manifest.json is invalid JSON');
+  }
+
+  if (!isRecord(parsed) || !hasExactKeys(parsed, ['schemaVersion', 'version', 'commit', 'buildDate', 'artifacts'])) {
+    throw new Error('bridge-manifest.json does not match the required schema');
+  }
+  if (
+    parsed.schemaVersion !== 1 ||
+    typeof parsed.version !== 'string' ||
+    typeof parsed.commit !== 'string' ||
+    typeof parsed.buildDate !== 'string' ||
+    !Array.isArray(parsed.artifacts)
+  ) {
+    throw new Error('bridge-manifest.json does not match the required schema');
+  }
+
+  const artifacts: BridgeManifestArtifact[] = [];
+  for (const value of parsed.artifacts) {
+    if (!isRecord(value) || !hasExactKeys(value, ['os', 'arch', 'file', 'sha256'])) {
+      throw new Error('bridge-manifest.json contains an artifact with an invalid schema');
+    }
+    if (
+      value.os !== 'windows' ||
+      (value.arch !== 'amd64' && value.arch !== 'arm64') ||
+      typeof value.file !== 'string' ||
+      typeof value.sha256 !== 'string'
+    ) {
+      throw new Error('bridge-manifest.json contains an unsupported artifact');
+    }
+    artifacts.push({ os: value.os, arch: value.arch, file: value.file, sha256: value.sha256 });
+  }
+
+  return {
+    schemaVersion: 1,
+    version: parsed.version,
+    commit: parsed.commit,
+    buildDate: parsed.buildDate,
+    artifacts,
+  };
+}
+
+function validateManifest(manifest: BridgeArtifactManifest): void {
+  if (
+    !manifest.version ||
+    manifest.version.length > 128 ||
+    !manifest.commit ||
+    manifest.commit.length > 128 ||
+    !manifest.buildDate ||
+    manifest.buildDate.length > 64
+  ) {
+    throw new Error('bridge-manifest.json has invalid metadata');
+  }
+  if (manifest.artifacts.length !== 2) {
+    throw new Error('bridge-manifest.json must contain exactly one Windows/amd64 and one Windows/arm64 artifact');
+  }
+
+  const seenArchitectures = new Set<BridgeArchitecture>();
+  for (const artifact of manifest.artifacts) {
+    if (seenArchitectures.has(artifact.arch)) {
+      throw new Error(`bridge-manifest.json contains a duplicate Windows/${artifact.arch} artifact`);
+    }
+    seenArchitectures.add(artifact.arch);
+
+    const expectedArtifact = ARTIFACTS[artifact.arch];
+    if (artifact.file !== expectedArtifact.file) {
+      throw new Error(`bridge-manifest.json has an unexpected filename for Windows/${artifact.arch}`);
+    }
+    if (!/^[a-f\d]{64}$/.test(artifact.sha256)) {
+      throw new Error(`bridge-manifest.json has an invalid SHA-256 for ${expectedArtifact.file}`);
+    }
+  }
+
+  if (!seenArchitectures.has('amd64') || !seenArchitectures.has('arm64')) {
+    throw new Error('bridge-manifest.json must contain exactly one Windows/amd64 and one Windows/arm64 artifact');
   }
 }
 
-export async function installLocalProxyPair(sourceDirectory: string, outputDirectory: string): Promise<void> {
-  const executable = await readFile(join(sourceDirectory, 'socktainer.exe')).catch(() => {
-    throw new Error(`socktainer.exe was not found in ${sourceDirectory}`);
-  });
-  const relay = await readFile(join(sourceDirectory, 'docker-relay')).catch(() => {
-    throw new Error(`docker-relay was not found in ${sourceDirectory}`);
-  });
-  if (!isWindowsAMD64Executable(executable)) {
-    throw new Error('socktainer.exe must be built for Windows/amd64 from the wslc-proxy repository');
+function parseChecksums(contents: Buffer): Map<string, string> {
+  const lines = contents.toString('utf8').trimEnd().split(/\r?\n/);
+  const checksums = new Map<string, string>();
+  const expectedFiles = new Set(Object.values(ARTIFACTS).map((artifact) => artifact.file));
+  for (const line of lines) {
+    const match = /^([a-f\d]{64}) {2}([^\s]+)$/.exec(line);
+    if (!match) {
+      throw new Error('checksums.txt contains an invalid entry');
+    }
+    const [, checksum, file] = match;
+    if (!expectedFiles.has(file)) {
+      throw new Error(`checksums.txt contains an unexpected filename: ${file}`);
+    }
+    if (checksums.has(file)) {
+      throw new Error(`checksums.txt contains a duplicate entry for ${file}`);
+    }
+    checksums.set(file, checksum);
   }
-  if (!isLinuxAMD64Executable(relay)) {
-    throw new Error('docker-relay must be built for Linux/amd64 from the wslc-proxy repository');
+  if (checksums.size !== expectedFiles.size) {
+    throw new Error('checksums.txt must contain exactly one checksum for each Windows bridge artifact');
   }
-  await replaceProxyFiles(outputDirectory, {
-    'socktainer.exe': executable,
-    'docker-relay': relay,
-  });
+  return checksums;
 }
 
-function isWindowsAMD64Executable(contents: Buffer): boolean {
+function isWindowsExecutableForMachine(contents: Buffer, machine: number): boolean {
   if (contents.length < 0x40 || contents.toString('ascii', 0, 2) !== 'MZ') {
     return false;
   }
   const headerOffset = contents.readUInt32LE(0x3c);
   return (
-    headerOffset + 6 <= contents.length &&
+    headerOffset >= 0x40 &&
+    headerOffset <= contents.length - 6 &&
     contents.toString('ascii', headerOffset, headerOffset + 4) === 'PE\0\0' &&
-    contents.readUInt16LE(headerOffset + 4) === 0x8664
+    contents.readUInt16LE(headerOffset + 4) === machine
   );
 }
 
-function isLinuxAMD64Executable(contents: Buffer): boolean {
-  return (
-    contents.length >= 20 &&
-    contents[0] === 0x7f &&
-    contents.toString('ascii', 1, 4) === 'ELF' &&
-    contents[4] === 2 &&
-    contents[5] === 1 &&
-    contents.readUInt16LE(18) === 0x3e
-  );
-}
-
-export async function installProxyArchive(
-  archive: Buffer,
-  expectedSha256: string,
-  outputDirectory: string,
-  expectedVersion?: string,
-): Promise<void> {
-  if (archive.length > MAX_ARCHIVE_SIZE) {
-    throw new Error('Socktainer release archive exceeds 512 MiB');
-  }
-  const actualSha256 = createHash('sha256').update(archive).digest('hex');
-  if (actualSha256 !== expectedSha256.toLowerCase()) {
-    throw new Error(`Socktainer checksum mismatch: expected ${expectedSha256}, received ${actualSha256}`);
-  }
-
-  const entries = new Map<string, Buffer>();
-  for (const entry of new AdmZip(archive).getEntries()) {
-    if (entry.isDirectory) {
-      continue;
-    }
-    const name = entry.entryName;
-    if (basename(name) !== name || name.includes('..') || name.includes('/') || name.includes('\\')) {
-      throw new Error(`Refusing unsafe Socktainer archive path: ${name}`);
-    }
-    if (!['socktainer.exe', 'docker-relay', 'manifest.json'].includes(name)) {
-      throw new Error(`Unexpected Socktainer archive entry: ${name}`);
-    }
-    if (entries.has(name)) {
-      throw new Error(`Socktainer archive contains duplicate ${name}`);
-    }
-    const maximumSize =
-      name === 'socktainer.exe' ? MAX_EXECUTABLE_SIZE : name === 'docker-relay' ? MAX_RELAY_SIZE : MAX_MANIFEST_SIZE;
-    if (entry.header.size <= 0 || entry.header.size > maximumSize) {
-      throw new Error(`Socktainer archive entry ${name} has an invalid size`);
-    }
-    const contents = entry.getData();
-    if (contents.length === 0 || contents.length > maximumSize) {
-      throw new Error(`Socktainer archive entry ${name} has an invalid size`);
-    }
-    entries.set(name, contents);
-  }
-
-  const executable = entries.get('socktainer.exe');
-  const relay = entries.get('docker-relay');
-  const manifestContents = entries.get('manifest.json');
-  if (!executable || !relay || !manifestContents) {
-    throw new Error('Socktainer ZIP must contain socktainer.exe, docker-relay, and manifest.json at its root');
-  }
-
-  let manifest: ProxyArtifactManifest;
+async function readBoundedFile(path: string, maximumSize: number, displayName: string): Promise<Buffer> {
+  let fileStat: Stats;
   try {
-    manifest = JSON.parse(manifestContents.toString('utf8')) as ProxyArtifactManifest;
+    fileStat = await stat(path);
   } catch {
-    throw new Error('Socktainer manifest.json is invalid JSON');
+    throw new Error(`${displayName} was not found`);
   }
-  if (
-    manifest.formatVersion !== 1 ||
-    !manifest.version ||
-    !manifest.sourceRevision ||
-    manifest.hostArchitecture !== 'windows/amd64' ||
-    manifest.guestArchitecture !== 'linux/amd64'
-  ) {
-    throw new Error('Socktainer manifest has an unsupported version or architecture');
+  if (!fileStat.isFile() || fileStat.size <= 0 || fileStat.size > maximumSize) {
+    throw new Error(`${displayName} has an invalid size or is not a regular file`);
   }
-  if (expectedVersion && manifest.version !== expectedVersion) {
-    throw new Error(`Socktainer manifest version ${manifest.version} does not match pinned version ${expectedVersion}`);
+  const contents = await readFile(path);
+  if (contents.length <= 0 || contents.length > maximumSize) {
+    throw new Error(`${displayName} has an invalid size`);
   }
-
-  await replaceProxyFiles(outputDirectory, {
-    'socktainer.exe': executable,
-    'docker-relay': relay,
-    'manifest.json': manifestContents,
-  });
+  return contents;
 }
 
-async function replaceProxyFiles(outputDirectory: string, files: Record<string, Buffer>): Promise<void> {
-  const parentDirectory = dirname(outputDirectory);
-  await mkdir(parentDirectory, { recursive: true });
-  const stagingDirectory = await mkdtemp(join(parentDirectory, '.socktainer-staging-'));
+async function isRegularFile(path: string): Promise<boolean> {
   try {
-    await Promise.all(
-      Object.entries(files).map(([name, contents]) => writeFile(join(stagingDirectory, name), contents)),
-    );
-    await rm(outputDirectory, { recursive: true, force: true });
-    await rename(stagingDirectory, outputDirectory);
-    await Promise.all([
-      access(join(outputDirectory, 'socktainer.exe')),
-      access(join(outputDirectory, 'docker-relay')),
-      ...(files['manifest.json'] ? [access(join(outputDirectory, 'manifest.json'))] : []),
-    ]);
-  } catch (error: unknown) {
-    await rm(stagingDirectory, { recursive: true, force: true });
-    throw error;
+    return (await stat(path)).isFile();
+  } catch {
+    return false;
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function hasExactKeys(record: Record<string, unknown>, expectedKeys: readonly string[]): boolean {
+  const keys = Object.keys(record);
+  return keys.length === expectedKeys.length && expectedKeys.every((key) => Object.hasOwn(record, key));
+}
+
+async function replaceStagedArtifacts(
+  outputBinDirectory: string,
+  artifacts: ReadonlyMap<BridgeArchitecture, Buffer>,
+  manifestContents: Buffer,
+  checksumsContents: Buffer,
+): Promise<void> {
+  const parentDirectory = dirname(outputBinDirectory);
+  await mkdir(parentDirectory, { recursive: true });
+  const stagingDirectory = await mkdtemp(join(parentDirectory, '.bridge-artifacts-staging-'));
+  let backupDirectory: string | undefined;
+  let movedExistingOutput = false;
+  let installed = false;
+
+  try {
+    for (const architecture of ['amd64', 'arm64'] as const) {
+      const artifact = artifacts.get(architecture);
+      if (!artifact) {
+        throw new Error(`Validated Windows/${architecture} artifact is missing`);
+      }
+      const targetDirectory = join(stagingDirectory, ARTIFACTS[architecture].outputDirectory);
+      await mkdir(targetDirectory, { recursive: true });
+      await writeFile(join(targetDirectory, 'wslc-bridge.exe'), artifact);
+    }
+    await Promise.all([
+      writeFile(join(stagingDirectory, 'bridge-manifest.json'), manifestContents),
+      writeFile(join(stagingDirectory, 'checksums.txt'), checksumsContents),
+    ]);
+
+    let outputExists = false;
+    try {
+      await stat(outputBinDirectory);
+      outputExists = true;
+    } catch (error: unknown) {
+      if (!isNodeError(error) || error.code !== 'ENOENT') {
+        throw error;
+      }
+    }
+
+    if (outputExists) {
+      backupDirectory = await mkdtemp(join(parentDirectory, '.bridge-artifacts-backup-'));
+      await rm(backupDirectory, { recursive: true, force: true });
+      await rename(outputBinDirectory, backupDirectory);
+      movedExistingOutput = true;
+    }
+
+    await rename(stagingDirectory, outputBinDirectory);
+    installed = true;
+  } catch (error: unknown) {
+    if (movedExistingOutput && backupDirectory && !installed) {
+      try {
+        await rename(backupDirectory, outputBinDirectory);
+        movedExistingOutput = false;
+      } catch (rollbackError: unknown) {
+        throw new AggregateError(
+          [error, rollbackError],
+          'Failed to install bridge artifacts and restore previous output',
+        );
+      }
+    }
+    throw error;
+  } finally {
+    await rm(stagingDirectory, { recursive: true, force: true });
+    if (backupDirectory && (!movedExistingOutput || installed)) {
+      await rm(backupDirectory, { recursive: true, force: true });
+    }
+  }
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && 'code' in error;
+}
+
+const extensionRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const scriptPath = process.argv[1] ? resolve(process.argv[1]) : undefined;
 if (scriptPath === fileURLToPath(import.meta.url)) {
-  new Downloader().downloadAndExtract().catch((error: unknown) => {
-    console.error(error);
-    process.exitCode = 1;
-  });
+  const outputBinDirectory = join(extensionRoot, 'dist', 'bin');
+  resolveBridgeArtifactDirectory(extensionRoot)
+    .then((sourceDirectory) => stageBridgeArtifacts(sourceDirectory, outputBinDirectory))
+    .catch((error: unknown) => {
+      console.error(error);
+      process.exitCode = 1;
+    });
 }

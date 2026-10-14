@@ -9,12 +9,8 @@ permissions:
 on:
   workflow_dispatch:
     inputs:
-      proxy_version:
-        description: Published wslc-proxy release version
-        required: true
-        type: string
-      proxy_sha256:
-        description: SHA-256 of the published proxy ZIP asset
+      bridge_artifact_base_url:
+        description: HTTPS directory containing the pinned bridge manifest, checksums, and Windows EXEs
         required: true
         type: string
 
@@ -23,6 +19,20 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Download pinned bridge files
+        env:
+          BRIDGE_ARTIFACT_BASE_URL: ${{ inputs.bridge_artifact_base_url }}
+        run: |
+          set -euo pipefail
+          case "$BRIDGE_ARTIFACT_BASE_URL" in
+            https://*) ;;
+            *) printf '%s\n' 'Bridge artifact base URL must use HTTPS' >&2; exit 1 ;;
+          esac
+          mkdir -p build/bridge-artifacts
+          base_url="${BRIDGE_ARTIFACT_BASE_URL%/}"
+          for file in bridge-manifest.json checksums.txt wslc-bridge-windows-amd64.exe wslc-bridge-windows-arm64.exe; do
+            curl --fail --location --proto '=https' --proto-redir '=https' --retry 3 "$base_url/$file" --output "build/bridge-artifacts/$file"
+          done
       - uses: pnpm/action-setup@v4
         with:
           version: 12.6.0
@@ -31,6 +41,7 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: pnpm download-dependencies
       - run: pnpm build
       - uses: redhat-actions/buildah-build@v2
         with:
@@ -39,8 +50,3 @@ jobs:
           containerfiles: build/Containerfile
           context: .
           oci: true
-          build-args: |
-            WSLC_PROXY_VERSION=${{ inputs.proxy_version }}
-            WSLC_PROXY_SHA256=${{ inputs.proxy_sha256 }}
-            WSLC_PROXY_BIN_DIR=
-            WSLC_PROXY_ARCHIVE=
