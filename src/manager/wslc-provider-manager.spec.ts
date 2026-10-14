@@ -16,6 +16,8 @@
  * SPDX-License-Identifier: Apache-2.0
  ***********************************************************************/
 
+import { request } from 'node:http';
+import { createConnection, createServer } from 'node:net';
 import type {
   ContainerProviderConnection,
   ExtensionContext,
@@ -28,15 +30,11 @@ import type {
 } from '@podman-desktop/api';
 import { process as podmanProcess, provider } from '@podman-desktop/api';
 import { Container } from 'inversify';
-import { EventEmitter } from 'node:events';
-import { request } from 'node:http';
-import { createConnection, createServer } from 'node:net';
-import type { Socket } from 'node:net';
-import { Duplex, PassThrough } from 'node:stream';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
+import { bridgeConfiguration } from '../config/bridge-config';
 import { ExtensionContextSymbol, TelemetryLoggerSymbol } from '../inject/symbol';
-import { WslcProxyManager } from './wslc-proxy-manager';
 import { WslVersionService } from './wsl-version-service';
+import { WslcBridgeManager } from './wslc-bridge-manager';
 import { WslcProviderManager } from './wslc-provider-manager';
 
 vi.mock(import('node:net'));
@@ -53,7 +51,6 @@ const telemetryLogger = {
 const originalConsoleError = console.error;
 const originalConsoleWarn = console.warn;
 const originalConsoleTrace = console.trace;
-const originalConsoleLog = console.log;
 
 let updateStatus: ReturnType<typeof vi.fn>;
 let updateVersion: ReturnType<typeof vi.fn>;
@@ -63,19 +60,23 @@ let registerConnectionMock: ReturnType<typeof vi.fn>;
 let installationDisposable: { dispose: ReturnType<typeof vi.fn> };
 let updateDisposable: { dispose: ReturnType<typeof vi.fn> };
 let connectionDisposable: { dispose: ReturnType<typeof vi.fn> };
-let bridgeServer: EventEmitter & {
-  listening: boolean;
-  listen: ReturnType<typeof vi.fn>;
-  close: ReturnType<typeof vi.fn>;
-};
-let proxySocket: Duplex;
-let proxyWrittenChunks: Buffer[];
-let bridgeClientHandler: ((socket: Socket) => void) | undefined;
 let container: Container;
 let manager: WslcProviderManager;
 let wslcProvider: Provider;
-let proxyReady: boolean;
-let proxyManager: WslcProxyManager;
+let bridgeReady: boolean;
+let bridgeManager: WslcBridgeManager;
+let unexpectedExit: ((error: Error) => void) | undefined;
+
+function createRunError(message: string): Error {
+  return Object.assign(new Error(message), {
+    exitCode: 1,
+    command: 'wslc.exe version',
+    stdout: '',
+    stderr: message,
+    cancelled: false,
+    killed: false,
+  });
+}
 
 async function waitForExecCalls(count: number): Promise<void> {
   await vi.waitFor(() => {
@@ -98,21 +99,24 @@ beforeEach(() => {
   console.error = vi.fn();
   console.warn = vi.fn();
   console.trace = vi.fn();
-  console.log = vi.fn();
   extensionContext.subscriptions.length = 0;
 
   updateStatus = vi.fn();
   updateVersion = vi.fn();
-  proxyReady = false;
-  proxyManager = {
-    isReady: vi.fn(() => proxyReady),
-    start: vi.fn(async () => {
-      proxyReady = true;
+  bridgeReady = false;
+  unexpectedExit = undefined;
+  bridgeManager = {
+    isReady: vi.fn(() => bridgeReady),
+    start: vi.fn(async (_signal: AbortSignal, onUnexpectedExit: (error: Error) => void) => {
+      unexpectedExit = onUnexpectedExit;
+      bridgeReady = true;
     }),
+    ping: vi.fn(async () => {}),
     stop: vi.fn(async () => {
-      proxyReady = false;
+      bridgeReady = false;
     }),
-  } as unknown as WslcProxyManager;
+  } as unknown as WslcBridgeManager;
+
   installationDisposable = { dispose: vi.fn() };
   updateDisposable = { dispose: vi.fn() };
   connectionDisposable = { dispose: vi.fn() };
@@ -129,70 +133,17 @@ beforeEach(() => {
   } as unknown as Provider;
   createProviderMock.mockReturnValue(wslcProvider);
 
-  bridgeServer = new EventEmitter() as EventEmitter & {
-    listening: boolean;
-    listen: ReturnType<typeof vi.fn>;
-    close: ReturnType<typeof vi.fn>;
-  };
-  bridgeServer.listening = false;
-  bridgeServer.listen = vi.fn(() => {
-    bridgeServer.listening = true;
-    queueMicrotask(() => bridgeServer.emit('listening'));
+  execMock.mockImplementation(async (command, args) => {
+    if (command === 'wsl' && args?.[0] === '--version') {
+      return { command: 'wsl --version', stdout: 'WSL version: 2.9.3.0', stderr: '' } as RunResult;
+    }
+    return { command: 'wslc.exe version', stdout: 'wslc 0.1.0', stderr: '' } as RunResult;
   });
-  bridgeServer.close = vi.fn((callback: () => void) => {
-    bridgeServer.listening = false;
-    callback();
-  });
-  bridgeClientHandler = undefined;
-  vi.mocked(createServer).mockImplementation((options, connectionListener) => {
-    bridgeClientHandler = (options as unknown as ((socket: Socket) => void) | undefined) ?? connectionListener;
-    return bridgeServer as never;
-  });
-
-  proxyWrittenChunks = [];
-  proxySocket = new Duplex({
-    read: () => {},
-    write: (chunk, _encoding, callback) => {
-      proxyWrittenChunks.push(Buffer.from(chunk));
-      callback();
-    },
-  });
-  vi.mocked(createConnection).mockReturnValue(proxySocket as never);
-  vi.mocked(request).mockImplementation((_options, callback) => {
-    const request = new EventEmitter() as EventEmitter & {
-      setTimeout: ReturnType<typeof vi.fn>;
-      end: ReturnType<typeof vi.fn>;
-      destroy: ReturnType<typeof vi.fn>;
-    };
-    request.setTimeout = vi.fn();
-    request.destroy = vi.fn();
-    request.end = vi.fn(() => {
-      const response = new EventEmitter() as EventEmitter & {
-        statusCode: number;
-        setEncoding: ReturnType<typeof vi.fn>;
-      };
-      response.statusCode = 200;
-      response.setEncoding = vi.fn();
-      const responseCallback = callback as unknown as ((response: EventEmitter) => void) | undefined;
-      responseCallback?.(response);
-      queueMicrotask(() => {
-        response.emit('data', 'OK');
-        response.emit('end');
-      });
-    });
-    return request as never;
-  });
-
-  execMock.mockResolvedValue({
-    command: 'wslc.exe version',
-    stdout: 'WSL version: 2.9.3.0',
-    stderr: '',
-  } as RunResult);
 
   container = new Container();
   container.bind(ExtensionContextSymbol).toConstantValue(extensionContext);
   container.bind(TelemetryLoggerSymbol).toConstantValue(telemetryLogger);
-  container.bind(WslcProxyManager).toConstantValue(proxyManager);
+  container.bind(WslcBridgeManager).toConstantValue(bridgeManager);
   container.bind(WslVersionService).toSelf();
   container.bind(WslcProviderManager).toSelf();
   manager = container.get(WslcProviderManager);
@@ -206,7 +157,6 @@ afterEach(async () => {
   console.error = originalConsoleError;
   console.warn = originalConsoleWarn;
   console.trace = originalConsoleTrace;
-  console.log = originalConsoleLog;
 });
 
 describe('WslcProviderManager', () => {
@@ -228,82 +178,106 @@ describe('WslcProviderManager', () => {
     expect(execMock).toHaveBeenNthCalledWith(3, 'wslc.exe', ['container', 'list']);
   });
 
-  test('registers a ready Docker connection on the WSLC named pipe', async () => {
+  test('registers a ready Docker connection directly on the Windows named pipe', async () => {
     const connection = await startProviderAndWaitForConnection();
 
-    expect(createServer).toHaveBeenCalledOnce();
-    expect(bridgeServer.listen).toHaveBeenCalledWith(String.raw`\\.\pipe\wslc_engine`);
+    expect(connection.name).toBe('WSL Containers');
     expect(connection.type).toBe('docker');
-    expect(connection.endpoint).toEqual({ socketPath: String.raw`\\.\pipe\wslc_engine` });
-    expect(proxyManager.start).toHaveBeenCalledOnce();
-    expect(request).toHaveBeenCalledWith(
-      { socketPath: String.raw`\\.\pipe\wslc_engine`, path: '/_ping', method: 'GET' },
-      expect.any(Function),
-    );
+    expect(connection.endpoint).toEqual({ socketPath: bridgeConfiguration.pipeName });
+    expect(connection.status()).toBe('started');
+    expect(bridgeManager.start).toHaveBeenCalledOnce();
+    expect(bridgeManager.start).toHaveBeenCalledWith(expect.any(AbortSignal), expect.any(Function));
+    expect(bridgeManager.ping).toHaveBeenCalledOnce();
+    expect(bridgeManager.isReady).toHaveBeenCalled();
+    expect(createServer).not.toHaveBeenCalled();
+    expect(createConnection).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
     expect(updateStatus).toHaveBeenCalledWith('ready');
   });
 
-  test('proxies named-pipe client traffic through the Socktainer TCP endpoint', async () => {
-    await startProviderAndWaitForConnection();
-    const request = Buffer.from('GET /v1.45/images/json HTTP/1.1\r\nHost: localhost\r\n\r\n');
-    const response = Buffer.from('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n[]');
-    const responseChunks: Buffer[] = [];
-    const socket = new Duplex({
-      read: () => {},
-      write: (chunk: Buffer, _encoding, callback) => {
-        responseChunks.push(Buffer.from(chunk));
-        callback();
-      },
-    });
-    const forwardedResponse = new Promise<Buffer>((resolveResponse) => {
-      socket.once('finish', () => resolveResponse(Buffer.concat(responseChunks)));
-    });
+  test('waits for bridge health ping before registering its connection', async () => {
+    let resolvePing!: () => void;
+    vi.mocked(bridgeManager.ping).mockReturnValue(
+      new Promise<void>((resolve) => {
+        resolvePing = resolve;
+      }),
+    );
 
-    bridgeClientHandler?.(socket as unknown as Socket);
-    socket.push(request);
+    await manager.registerContainerProvider();
+    await waitForExecCalls(3);
+    await vi.waitFor(() => expect(bridgeManager.ping).toHaveBeenCalledOnce());
+    expect(registerConnectionMock).not.toHaveBeenCalled();
 
-    expect(createConnection).toHaveBeenCalledWith({ host: 'localhost', port: 2375 });
-    await vi.waitFor(() => expect(Buffer.concat(proxyWrittenChunks)).toEqual(request));
-
-    proxySocket.push(response);
-    proxySocket.push(null);
-    expect(await forwardedResponse).toEqual(response);
-
-    socket.destroy();
+    resolvePing();
+    await vi.waitFor(() => expect(registerConnectionMock).toHaveBeenCalledOnce());
   });
 
-  describe('when wslc.exe is missing', () => {
-    beforeEach(() => {
-      execMock.mockRejectedValueOnce(new Error('not found'));
+  test('does not register a connection when the bridge does not become ready', async () => {
+    vi.mocked(bridgeManager.start).mockImplementation(async () => {
+      bridgeReady = false;
     });
 
-    test('marks the provider not installed and registers an installation action', async () => {
-      await manager.registerContainerProvider();
-      await vi.waitFor(() => expect(registerInstallationMock).toHaveBeenCalledOnce());
+    await manager.registerContainerProvider();
+    await waitForExecCalls(3);
+    await vi.waitFor(() => expect(updateStatus).toHaveBeenCalledWith('error'));
 
-      expect(updateStatus).toHaveBeenCalledWith('not-installed');
-      expect(execMock).toHaveBeenCalledOnce();
-      expect(createServer).not.toHaveBeenCalled();
-      expect(registerInstallationMock.mock.calls[0]?.[0]).toHaveProperty('install');
-    });
+    expect(bridgeManager.ping).not.toHaveBeenCalled();
+    expect(registerConnectionMock).not.toHaveBeenCalled();
+  });
 
-    test('installs WSL and refreshes the provider after the installation action runs', async () => {
-      await manager.registerContainerProvider();
-      await vi.waitFor(() => expect(registerInstallationMock).toHaveBeenCalledOnce());
+  test('marks WSLC not installed only when the executable is missing', async () => {
+    execMock.mockRejectedValueOnce(createRunError('spawn wslc.exe ENOENT'));
 
-      const installation = registerInstallationMock.mock.calls[0]?.[0] as ProviderInstallation;
-      const installPromise = installation.install({ log: vi.fn() } as unknown as Logger);
-      await waitForExecCalls(5);
-      await installPromise;
+    await manager.registerContainerProvider();
+    await vi.waitFor(() => expect(registerInstallationMock).toHaveBeenCalledOnce());
 
-      expect(execMock).toHaveBeenCalledWith('wsl', ['--update'], { encoding: 'utf16le' });
-      expect(installationDisposable.dispose).toHaveBeenCalledOnce();
-      expect(registerConnectionMock).toHaveBeenCalledOnce();
-    });
+    expect(updateStatus).toHaveBeenCalledWith('not-installed');
+    expect(updateVersion).toHaveBeenCalledOnce();
+    expect(execMock).toHaveBeenCalledOnce();
+    expect(bridgeManager.start).not.toHaveBeenCalled();
+    expect(registerInstallationMock.mock.calls[0]?.[0]).toHaveProperty('install');
+  });
+
+  test('runs wsl --update from the installation action and refreshes provider status', async () => {
+    execMock.mockRejectedValueOnce(createRunError('wslc.exe was not found'));
+
+    await manager.registerContainerProvider();
+    await vi.waitFor(() => expect(registerInstallationMock).toHaveBeenCalledOnce());
+    const installation = registerInstallationMock.mock.calls[0]?.[0] as ProviderInstallation;
+    const installPromise = installation.install({ log: vi.fn() } as unknown as Logger);
+    await waitForExecCalls(5);
+    await installPromise;
+
+    expect(execMock).toHaveBeenCalledWith('wsl', ['--update'], { encoding: 'utf16le' });
+    expect(installationDisposable.dispose).toHaveBeenCalledOnce();
+    expect(registerConnectionMock).toHaveBeenCalledOnce();
+  });
+
+  test('sets provider error for an arbitrary WSLC command failure without registering installation', async () => {
+    execMock.mockRejectedValueOnce(createRunError('wslc.exe version exited with code 1: access denied'));
+
+    await manager.registerContainerProvider();
+    await vi.waitFor(() => expect(updateStatus).toHaveBeenCalledWith('error'));
+
+    expect(registerInstallationMock).not.toHaveBeenCalled();
+    expect(updateStatus).not.toHaveBeenCalledWith('not-installed');
+    expect(bridgeManager.stop).toHaveBeenCalled();
+    expect(console.error).toHaveBeenCalledWith('Error checking WSL Containers version', expect.any(Error));
+  });
+
+  test('sets provider error for empty or malformed successful version output', async () => {
+    execMock.mockResolvedValueOnce({ command: 'wslc.exe version', stdout: 'not a version', stderr: '' } as RunResult);
+
+    await manager.registerContainerProvider();
+    await vi.waitFor(() => expect(updateStatus).toHaveBeenCalledWith('error'));
+
+    expect(registerInstallationMock).not.toHaveBeenCalled();
+    expect(updateStatus).not.toHaveBeenCalledWith('not-installed');
+    expect(bridgeManager.start).not.toHaveBeenCalled();
   });
 
   test('leaves Install registered when the WSL update command fails', async () => {
-    execMock.mockRejectedValueOnce(new Error('wslc not found')).mockRejectedValueOnce(new Error('update failed'));
+    execMock.mockRejectedValueOnce(createRunError('wslc not found')).mockRejectedValueOnce(new Error('update failed'));
 
     await manager.registerContainerProvider();
     await vi.waitFor(() => expect(registerInstallationMock).toHaveBeenCalledOnce());
@@ -313,7 +287,7 @@ describe('WslcProviderManager', () => {
 
     expect(updateStatus).toHaveBeenCalledWith('not-installed');
     expect(registerInstallationMock).toHaveBeenCalledOnce();
-    expect(createServer).not.toHaveBeenCalled();
+    expect(bridgeManager.start).not.toHaveBeenCalled();
   });
 
   test('keeps WSLC installed and registers an update for an older WSL version', async () => {
@@ -329,10 +303,10 @@ describe('WslcProviderManager', () => {
     expect(updateStatus).toHaveBeenCalledWith('installed');
     expect(registerInstallationMock).not.toHaveBeenCalled();
     expect(execMock).toHaveBeenCalledTimes(2);
-    expect(createServer).not.toHaveBeenCalled();
+    expect(bridgeManager.start).not.toHaveBeenCalled();
   });
 
-  test('updates WSL and refreshes provider status', async () => {
+  test('runs wsl --update from the update action and refreshes provider status', async () => {
     execMock
       .mockResolvedValueOnce({ command: 'wslc version', stdout: 'wslc 0.1.0', stderr: '' } as RunResult)
       .mockResolvedValueOnce({ command: 'wsl --version', stdout: 'WSL version: 2.9.2.0', stderr: '' } as RunResult);
@@ -359,7 +333,7 @@ describe('WslcProviderManager', () => {
     await vi.waitFor(() => expect(updateStatus).toHaveBeenCalledWith('installed'));
 
     expect(registerUpdateMock).not.toHaveBeenCalled();
-    expect(createServer).not.toHaveBeenCalled();
+    expect(bridgeManager.start).not.toHaveBeenCalled();
   });
 
   test('marks runtime stopped when the documented container-list probe fails', async () => {
@@ -371,41 +345,86 @@ describe('WslcProviderManager', () => {
     await manager.registerContainerProvider();
     await vi.waitFor(() => expect(updateStatus).toHaveBeenCalledWith('stopped'));
 
-    expect(createServer).not.toHaveBeenCalled();
+    expect(bridgeManager.start).not.toHaveBeenCalled();
     expect(registerConnectionMock).not.toHaveBeenCalled();
   });
 
-  test('does not create another named pipe or connection after a monitoring refresh', async () => {
+  test('refreshes bridge health without registering a duplicate connection', async () => {
     await startProviderAndWaitForConnection();
 
     await manager.updateContainerSystemStatus(wslcProvider);
 
-    expect(createServer).toHaveBeenCalledOnce();
+    expect(bridgeManager.ping).toHaveBeenCalledTimes(2);
     expect(registerConnectionMock).toHaveBeenCalledOnce();
+    expect(createServer).not.toHaveBeenCalled();
+    expect(createConnection).not.toHaveBeenCalled();
   });
 
-  test('does not register a connection if the named pipe fails to listen', async () => {
-    bridgeServer.listen = vi.fn(() => {
-      queueMicrotask(() => bridgeServer.emit('error', new Error('pipe unavailable')));
-    });
+  test('cleans up the registered connection after an unexpected bridge exit', async () => {
+    await startProviderAndWaitForConnection();
+
+    unexpectedExit?.(new Error('bridge exited'));
+    await vi.waitFor(() => expect(connectionDisposable.dispose).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(telemetryLogger.logUsage).toHaveBeenCalledWith('bridgeExited'));
+
+    expect(bridgeManager.stop).toHaveBeenCalled();
+    expect(updateStatus).toHaveBeenCalledWith('installed');
+    expect(extensionContext.subscriptions).not.toContain(connectionDisposable);
+  });
+
+  test('does not overlap concurrent refreshes', async () => {
+    await startProviderAndWaitForConnection();
+
+    let resolveVersion!: (result: RunResult) => void;
+    execMock.mockReturnValueOnce(
+      new Promise<RunResult>((resolve) => {
+        resolveVersion = resolve;
+      }),
+    );
+    const firstRefresh = manager.refresh();
+    await waitForExecCalls(4);
+    const overlappingRefresh = manager.refresh();
+    expect(execMock).toHaveBeenCalledTimes(4);
+
+    resolveVersion({ command: 'wslc.exe version', stdout: 'wslc 0.1.0', stderr: '' } as RunResult);
+    await Promise.all([firstRefresh, overlappingRefresh]);
+    expect(execMock).toHaveBeenCalledTimes(6);
+  });
+
+  test('polls again after thirty seconds', async () => {
+    await startProviderAndWaitForConnection();
+    for (let flush = 0; flush < 10; flush += 1) {
+      await Promise.resolve();
+    }
+    expect(vi.getTimerCount()).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(bridgeConfiguration.refreshIntervalMs);
+    await waitForExecCalls(6);
+  });
+
+  test('bounds consecutive bridge startup retries', async () => {
+    vi.mocked(bridgeManager.start).mockRejectedValue(new Error('bridge startup failed'));
 
     await manager.registerContainerProvider();
-    await vi.waitFor(() => expect(updateStatus).toHaveBeenCalledWith('error'));
+    await vi.waitFor(() => expect(bridgeManager.start).toHaveBeenCalledTimes(1));
+    for (let attempt = 2; attempt <= bridgeConfiguration.maxConsecutiveStartupFailures; attempt += 1) {
+      await vi.advanceTimersByTimeAsync(bridgeConfiguration.refreshIntervalMs);
+      await vi.waitFor(() => expect(bridgeManager.start).toHaveBeenCalledTimes(attempt));
+    }
+    await vi.advanceTimersByTimeAsync(bridgeConfiguration.refreshIntervalMs);
 
-    expect(registerConnectionMock).not.toHaveBeenCalled();
+    expect(bridgeManager.start).toHaveBeenCalledTimes(bridgeConfiguration.maxConsecutiveStartupFailures);
+    expect(updateStatus).toHaveBeenCalledWith('error');
   });
 
-  test('closes the named pipe, TCP clients, and Socktainer process on deactivation', async () => {
+  test('stops only the bridge manager and disposes provider connection on deactivation', async () => {
     await startProviderAndWaitForConnection();
-    const socket = new PassThrough();
-    bridgeClientHandler?.(socket as unknown as Socket);
 
     await manager.deactivate();
 
     expect(connectionDisposable.dispose).toHaveBeenCalledOnce();
-    expect(socket.destroyed).toBeTruthy();
-    expect(proxySocket.destroyed).toBeTruthy();
-    expect(proxyManager.stop).toHaveBeenCalledOnce();
-    expect(bridgeServer.close).toHaveBeenCalledOnce();
+    expect(bridgeManager.stop).toHaveBeenCalledOnce();
+    expect(createServer).not.toHaveBeenCalled();
+    expect(createConnection).not.toHaveBeenCalled();
   });
 });

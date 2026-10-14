@@ -23,7 +23,15 @@ let wslcExtension: WslcExtension | undefined;
 
 export async function activate(extensionContext: ExtensionContext): Promise<void> {
   wslcExtension ??= new WslcExtension(extensionContext);
-  await wslcExtension.activate();
+  const extension = wslcExtension;
+  try {
+    await extension.activate();
+  } catch (error: unknown) {
+    if (wslcExtension === extension) {
+      wslcExtension = undefined;
+    }
+    throw error;
+  }
 }
 
 export async function deactivate(): Promise<void> {

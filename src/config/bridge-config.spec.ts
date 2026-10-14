@@ -23,22 +23,9 @@ beforeEach(() => {
   vi.resetAllMocks();
 });
 
-describe('bridgeConfiguration artifact metadata', () => {
-  test('defines the artifact repository, archive, and binary names', () => {
-    expect(bridgeConfiguration.repository).toBe('https://github.com/l0rd/wslc-proxy');
-    expect(bridgeConfiguration.assetName).toBe('wslc-proxy-windows-amd64-linux-amd64.zip');
-    expect(bridgeConfiguration.executableName).toBe('socktainer.exe');
-    expect(bridgeConfiguration.relayName).toBe('docker-relay');
-  });
-});
-
-describe('bridgeConfiguration bridge endpoints', () => {
-  test('defines the Socktainer TCP endpoint', () => {
-    expect(bridgeConfiguration.host).toBe('localhost');
-    expect(bridgeConfiguration.port).toBe(2375);
-  });
-
-  test('defines the WSLC named pipe', () => {
+describe('bridgeConfiguration runtime', () => {
+  test('defines the bridge binary and WSLC pipe', () => {
+    expect(bridgeConfiguration.executableName).toBe('wslc-bridge.exe');
     expect(bridgeConfiguration.pipeName).toBe(String.raw`\\.\pipe\wslc_engine`);
   });
 });
@@ -47,7 +34,6 @@ describe('bridgeConfiguration monitoring and timeout settings', () => {
   test('defines the operational timeouts and retry limit', () => {
     expect(bridgeConfiguration.startupTimeoutMs).toBe(180_000);
     expect(bridgeConfiguration.requestTimeoutMs).toBe(5_000);
-    expect(bridgeConfiguration.readinessPollIntervalMs).toBe(250);
     expect(bridgeConfiguration.shutdownTimeoutMs).toBe(10_000);
     expect(bridgeConfiguration.maxConsecutiveStartupFailures).toBe(3);
   });

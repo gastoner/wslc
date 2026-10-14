@@ -3,5 +3,6 @@ dist/
 /build/proxy-bin/
 /build/proxy-binaries/
 /build/proxy-artifacts.zip
+/build/bridge-artifacts/
 coverage/
 *.log

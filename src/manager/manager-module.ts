@@ -18,12 +18,12 @@
 
 import { ContainerModule } from 'inversify';
 import { WslVersionService } from './wsl-version-service';
-import { WslcProxyManager } from './wslc-proxy-manager';
+import { WslcBridgeManager } from './wslc-bridge-manager';
 import { WslcProviderManager } from './wslc-provider-manager';
 
 const managersModule = new ContainerModule((options) => {
   options.bind<WslVersionService>(WslVersionService).toSelf().inSingletonScope();
-  options.bind<WslcProxyManager>(WslcProxyManager).toSelf().inSingletonScope();
+  options.bind<WslcBridgeManager>(WslcBridgeManager).toSelf().inSingletonScope();
   options.bind<WslcProviderManager>(WslcProviderManager).toSelf().inSingletonScope();
 });
 
