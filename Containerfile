@@ -29,6 +29,7 @@ RUN npm i -g corepack@0.36.0 && corepack enable
 COPY . /app
 WORKDIR /app
 RUN pnpm install --frozen-lockfile
+RUN WSLC_BRIDGE_ARTIFACT_DIR=build/bridge-artifacts pnpm download-dependencies
 RUN pnpm build
 
 FROM scratch
