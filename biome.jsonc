@@ -1,0 +1,34 @@
+{
+  "formatter": {
+    "indentStyle": "space",
+    "lineWidth": 120,
+    "attributePosition": "auto"
+  },
+  "files": {
+    "ignoreUnknown": true,
+    "includes": [
+      "**",
+      "!**/build/**",
+      "!**/coverage/**",
+      "!**/dist/**",
+      "!**/node_modules/**",
+      "!**/*.md",
+      "!**/*.yaml",
+      "!**/*.yml"
+    ]
+  },
+  "javascript": {
+    "formatter": {
+      "arrowParentheses": "asNeeded",
+      "bracketSameLine": true,
+      "attributePosition": "auto",
+      "quoteStyle": "single"
+    }
+  },
+  "json": {
+    "formatter": {
+      "indentWidth": 2
+    }
+  },
+  "assist": { "actions": { "source": { "organizeImports": "off" } } }
+}

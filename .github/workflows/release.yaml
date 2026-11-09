@@ -1,0 +1,155 @@
+#
+# Copyright (C) 2026 Red Hat, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: release
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release
+        required: true
+        type: string
+      branch:
+        description: Branch to release
+        required: true
+        default: main
+        type: string
+
+jobs:
+  tag:
+    name: Tag release
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    outputs:
+      githubTag: ${{ steps.version.outputs.githubTag }}
+      extVersion: ${{ steps.version.outputs.extVersion }}
+      releaseId: ${{ steps.create-release.outputs.id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.branch }}
+
+      - uses: pnpm/setup@a0881977cd8ea73b1ed212236c99ca10dcc80cf4 # v3
+        with:
+          node-version-file: .nvmrc
+          install: false
+
+      - name: Generate tag utilities
+        id: version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release version: $RELEASE_VERSION" >&2
+            exit 1
+          fi
+          echo "githubTag=v${RELEASE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "extVersion=${RELEASE_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Update manifest and create tag
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.extVersion }}
+          RELEASE_TAG: ${{ steps.version.outputs.githubTag }}
+          RELEASE_BRANCH: ${{ inputs.branch }}
+          ACTOR: ${{ github.actor }}
+          ACTOR_ID: ${{ github.actor_id }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const manifest = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          manifest.version = process.env.RELEASE_VERSION;
+          fs.writeFileSync('package.json', `${JSON.stringify(manifest, null, 2)}\n`);
+          NODE
+
+          git config --local user.name "$ACTOR"
+          git config --local user.email "${ACTOR_ID}+${ACTOR}@users.noreply.github.com"
+          git add package.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: release ${RELEASE_TAG}"
+          fi
+          git tag "$RELEASE_TAG"
+          git push origin "HEAD:${RELEASE_BRANCH}"
+          git push origin "$RELEASE_TAG"
+
+      - name: Create draft release
+        id: create-release
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag: ${{ steps.version.outputs.githubTag }}
+          name: ${{ steps.version.outputs.githubTag }}
+          draft: true
+          prerelease: ${{ contains(steps.version.outputs.extVersion, '-') }}
+
+  build-image:
+    name: Build OCI image
+    needs: tag
+    runs-on: ubuntu-26.04
+    outputs:
+      artifact-id: ${{ steps.build.outputs.artifact-id }}
+    steps:
+      - name: Build OCI
+        id: build
+        uses: podman-desktop/gh-extensions-actions/.github/actions/oci-build@e59cd52b942e8dfcc187293c5d8e9f3831c7ac0c # v0.11.0
+        with:
+          ref: ${{ needs.tag.outputs.githubTag }}
+          containerfile: Containerfile
+
+  publish-image:
+    name: Publish OCI image
+    needs: [tag, build-image]
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Publish OCI
+        uses: podman-desktop/gh-extensions-actions/.github/actions/oci-publish@e59cd52b942e8dfcc187293c5d8e9f3831c7ac0c # v0.11.0
+        with:
+          run-id: ${{ github.run_id }}
+          artifact-id: ${{ needs.build-image.outputs.artifact-id }}
+          github-token: ${{ github.token }}
+          registry: ghcr.io
+          registry-username: ${{ github.repository_owner }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+          image-name: ${{ github.repository }}
+          tags: ${{ needs.tag.outputs.extVersion }}${{ !contains(needs.tag.outputs.extVersion, '-') && ' latest' || '' }}
+
+  release:
+    name: Publish GitHub release
+    needs: [tag, publish-image]
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - name: Publish release
+        uses: StuYarrow/publish-release@01f2a1365bacd77bad861873a7fdf274ab49eefd # v1.1.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          id: ${{ needs.tag.outputs.releaseId }}
