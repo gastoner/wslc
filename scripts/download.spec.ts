@@ -20,9 +20,14 @@ import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, test } from 'vitest';
-import { BRIDGE_ARTIFACT_SHA256, type BridgeArtifactPins } from '../src/config/bridge-artifacts';
-import { resolveBridgeArtifactDirectory, stageBridgeArtifacts } from './download';
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
+import { BRIDGE_ARTIFACT_SHA256, BRIDGE_RELEASE, type BridgeArtifactPins } from '../src/config/bridge-artifacts';
+import {
+  bridgeReleaseAssetUrl,
+  downloadBridgeArtifacts,
+  resolveBridgeArtifactSource,
+  stageBridgeArtifacts,
+} from './download';
 
 const AMD64_FILE = 'wslc-bridge-windows-amd64.exe';
 const ARM64_FILE = 'wslc-bridge-windows-arm64.exe';
@@ -34,6 +39,8 @@ const fixturePins: BridgeArtifactPins = {
 };
 
 let root: string;
+let extensionRoot: string;
+let siblingArtifactDirectory: string;
 let sourceDirectory: string;
 let outputBinDirectory: string;
 
@@ -71,6 +78,29 @@ function createChecksums(amd64: Buffer = amd64Executable, arm64: Buffer = arm64E
   return `${sha256(amd64)}  ${AMD64_FILE}\n${sha256(arm64)}  ${ARM64_FILE}\n`;
 }
 
+function createReleaseFiles(overrides: Record<string, Buffer> = {}): Record<string, Buffer> {
+  return {
+    'bridge-manifest.json': Buffer.from(JSON.stringify(createManifest())),
+    'checksums.txt': Buffer.from(createChecksums()),
+    [AMD64_FILE]: amd64Executable,
+    [ARM64_FILE]: arm64Executable,
+    ...overrides,
+  };
+}
+
+function stubFetch(files: Record<string, Buffer>, requested: string[] = []): typeof fetch {
+  return async (input: Parameters<typeof fetch>[0]): Promise<Response> => {
+    const url = input instanceof Request ? input.url : String(input);
+    requested.push(url);
+    const file = url.slice(url.lastIndexOf('/') + 1);
+    const contents = files[file];
+    if (!contents) {
+      return new Response('not found', { status: 404 });
+    }
+    return new Response(new Uint8Array(contents));
+  };
+}
+
 async function writeArtifactFixture(
   options: { manifest?: unknown; checksums?: string; amd64?: Buffer; arm64?: Buffer } = {},
 ): Promise<void> {
@@ -90,11 +120,15 @@ async function writeArtifactFixture(
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), 'wslc-bridge-artifacts-test-'));
+  extensionRoot = join(root, 'extension');
+  siblingArtifactDirectory = join(root, 'wslc-bridge', 'dist');
   sourceDirectory = join(root, 'source');
-  outputBinDirectory = join(root, 'dist', 'bin');
+  outputBinDirectory = join(extensionRoot, 'dist', 'bin');
+  await mkdir(extensionRoot, { recursive: true });
 });
 
 afterEach(async () => {
+  vi.unstubAllGlobals();
   await rm(root, { recursive: true, force: true });
 });
 
@@ -114,8 +148,8 @@ describe('stageBridgeArtifacts', () => {
 
   test('uses the checked-in per-architecture digest pins', () => {
     expect(BRIDGE_ARTIFACT_SHA256).toEqual({
-      amd64: '0372c9a5c226ac9a79f6860f0b2ff07adfc90774cbdef1d95e6f9d0115b2a16a',
-      arm64: '9807683cf3f33996de8de4a49f643b03fad60f40031dd71930d34d6b69384945',
+      amd64: 'b9f0a90e70c66e274fe6afdadf05ab48ce033a5ad645425c2d0d4affe052ed8a',
+      arm64: '484e39febfdeb4c40b049966c7d6f18754974dc21d99942bfe7ac14d8dbf0fa5',
     });
   });
 
@@ -214,22 +248,118 @@ describe('stageBridgeArtifacts', () => {
   });
 });
 
-describe('resolveBridgeArtifactDirectory', () => {
+describe('bridgeReleaseAssetUrl', () => {
+  test('builds the asset URL for the pinned release', () => {
+    expect(bridgeReleaseAssetUrl(BRIDGE_RELEASE, AMD64_FILE)).toBe(
+      `https://github.com/${BRIDGE_RELEASE.repository}/releases/download/${BRIDGE_RELEASE.tag}/${AMD64_FILE}`,
+    );
+  });
+});
+
+describe('downloadBridgeArtifacts', () => {
+  test('downloads every release asset into the destination directory', async () => {
+    const destinationDirectory = join(root, 'release');
+
+    await downloadBridgeArtifacts(BRIDGE_RELEASE, destinationDirectory, stubFetch(createReleaseFiles()));
+
+    expect(await readFile(join(destinationDirectory, AMD64_FILE))).toEqual(amd64Executable);
+    expect(await readFile(join(destinationDirectory, ARM64_FILE))).toEqual(arm64Executable);
+    expect(await readFile(join(destinationDirectory, 'bridge-manifest.json'), 'utf8')).toBe(
+      JSON.stringify(createManifest()),
+    );
+    expect(await readFile(join(destinationDirectory, 'checksums.txt'), 'utf8')).toBe(createChecksums());
+  });
+
+  test('fails with the download URL when an asset is missing from the release', async () => {
+    const files = createReleaseFiles();
+    delete files[ARM64_FILE];
+
+    await expect(downloadBridgeArtifacts(BRIDGE_RELEASE, join(root, 'release'), stubFetch(files))).rejects.toThrow(
+      `Failed to download ${bridgeReleaseAssetUrl(BRIDGE_RELEASE, ARM64_FILE)} (404)`,
+    );
+  });
+
+  test('rejects an asset that exceeds its size limit', async () => {
+    const files = createReleaseFiles({ 'checksums.txt': Buffer.alloc(64 * 1024) });
+
+    await expect(downloadBridgeArtifacts(BRIDGE_RELEASE, join(root, 'release'), stubFetch(files))).rejects.toThrow(
+      'checksums.txt has an invalid size',
+    );
+  });
+});
+
+describe('resolveBridgeArtifactSource', () => {
   test('uses the explicit local artifact directory first', async () => {
-    expect(await resolveBridgeArtifactDirectory(root, join(root, 'custom-artifacts'))).toBe(
-      join(root, 'custom-artifacts'),
+    const source = await resolveBridgeArtifactSource(extensionRoot, {
+      WSLC_BRIDGE_ARTIFACT_DIR: join(root, 'custom-artifacts'),
+    });
+
+    expect(source.directory).toBe(join(root, 'custom-artifacts'));
+    await source.dispose();
+  });
+
+  test('rejects a blank explicit artifact directory', async () => {
+    await expect(resolveBridgeArtifactSource(extensionRoot, { WSLC_BRIDGE_ARTIFACT_DIR: '   ' })).rejects.toThrow(
+      'WSLC_BRIDGE_ARTIFACT_DIR must name a local artifact directory',
     );
   });
 
   test('prefers build/bridge-artifacts when it contains the manifest', async () => {
-    const buildArtifactDirectory = join(root, 'build', 'bridge-artifacts');
+    const buildArtifactDirectory = join(extensionRoot, 'build', 'bridge-artifacts');
     await mkdir(buildArtifactDirectory, { recursive: true });
     await writeFile(join(buildArtifactDirectory, 'bridge-manifest.json'), '{}');
 
-    expect(await resolveBridgeArtifactDirectory(root, undefined)).toBe(buildArtifactDirectory);
+    const source = await resolveBridgeArtifactSource(extensionRoot, {});
+
+    expect(source.directory).toBe(buildArtifactDirectory);
+    await source.dispose();
   });
 
-  test('falls back to the sibling bridge dist directory when no build manifest exists', async () => {
-    expect(await resolveBridgeArtifactDirectory(root, undefined)).toBe(join(root, '..', 'wslc-bridge', 'dist'));
+  test('falls back to the sibling bridge dist directory outside CI', async () => {
+    await mkdir(siblingArtifactDirectory, { recursive: true });
+    await writeFile(join(siblingArtifactDirectory, 'bridge-manifest.json'), '{}');
+
+    const source = await resolveBridgeArtifactSource(extensionRoot, {});
+
+    expect(source.directory).toBe(siblingArtifactDirectory);
+    await source.dispose();
+  });
+
+  test('downloads the pinned release in CI, ignores the sibling checkout, and cleans up on dispose', async () => {
+    await mkdir(siblingArtifactDirectory, { recursive: true });
+    await writeFile(join(siblingArtifactDirectory, 'bridge-manifest.json'), '{}');
+    const requested: string[] = [];
+    vi.stubGlobal('fetch', stubFetch(createReleaseFiles(), requested));
+
+    const source = await resolveBridgeArtifactSource(extensionRoot, { CI: 'true' });
+
+    expect(source.directory).not.toBe(siblingArtifactDirectory);
+    expect(requested).toEqual([
+      bridgeReleaseAssetUrl(BRIDGE_RELEASE, 'bridge-manifest.json'),
+      bridgeReleaseAssetUrl(BRIDGE_RELEASE, 'checksums.txt'),
+      bridgeReleaseAssetUrl(BRIDGE_RELEASE, AMD64_FILE),
+      bridgeReleaseAssetUrl(BRIDGE_RELEASE, ARM64_FILE),
+    ]);
+
+    // The downloaded release feeds the regular staging pipeline, so all pin and PE checks still run.
+    await stageBridgeArtifacts(source.directory, outputBinDirectory, fixturePins);
+    expect(await readFile(join(outputBinDirectory, 'win32-x64', 'wslc-bridge.exe'))).toEqual(amd64Executable);
+
+    await source.dispose();
+    await expect(readFile(source.directory)).rejects.toThrow();
+  });
+
+  test('honours the release repository and tag overrides', async () => {
+    const requested: string[] = [];
+    vi.stubGlobal('fetch', stubFetch(createReleaseFiles(), requested));
+
+    const source = await resolveBridgeArtifactSource(extensionRoot, {
+      CI: 'true',
+      WSLC_BRIDGE_RELEASE_REPOSITORY: 'example/wslc-bridge',
+      WSLC_BRIDGE_RELEASE_TAG: 'v9.9.9',
+    });
+
+    expect(requested[0]).toBe('https://github.com/example/wslc-bridge/releases/download/v9.9.9/bridge-manifest.json');
+    await source.dispose();
   });
 });
