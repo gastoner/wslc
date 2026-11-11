@@ -87,10 +87,6 @@ Copy-Item "..\wslc-bridge\dist\*" build\bridge-artifacts\
 podman build -t wslc-local .
 ```
 
-The manual `build-next` workflow takes an HTTPS base URL for a bridge artifact directory, downloads the same four files
-into `build/bridge-artifacts` (which then takes precedence over the pinned release), and builds the image from that
-staged directory.
-
 ### Releasing a new bridge version
 
 1. Run the `release` workflow in [`wslc-bridge`](https://github.com/gastoner/wslc-bridge) with the new version. It runs
