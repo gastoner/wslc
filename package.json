@@ -3,7 +3,7 @@
   "repository": "https://github.com/podman-desktop/wslc",
   "displayName": "WSL Containers",
   "description": "Manage WSL Containers on Windows in Podman Desktop.",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "icon": "icon.png",
   "publisher": "podman-desktop",
   "license": "Apache-2.0",
