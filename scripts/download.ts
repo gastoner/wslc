@@ -19,12 +19,15 @@
 import { createHash } from 'node:crypto';
 import type { Stats } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   BRIDGE_ARTIFACT_SHA256,
+  BRIDGE_RELEASE,
   type BridgeArchitecture,
   type BridgeArtifactPins,
+  type BridgeRelease,
 } from '../src/config/bridge-artifacts';
 
 export interface BridgeManifestArtifact {
@@ -51,23 +54,102 @@ const ARTIFACTS: Readonly<Record<BridgeArchitecture, { file: string; outputDirec
   arm64: { file: 'wslc-bridge-windows-arm64.exe', outputDirectory: 'win32-arm64', machine: 0xaa64 },
 };
 
-export async function resolveBridgeArtifactDirectory(
+const RELEASE_ASSETS: readonly { readonly file: string; readonly maximumSize: number }[] = [
+  { file: 'bridge-manifest.json', maximumSize: MAX_MANIFEST_SIZE },
+  { file: 'checksums.txt', maximumSize: MAX_CHECKSUMS_SIZE },
+  { file: ARTIFACTS.amd64.file, maximumSize: MAX_EXECUTABLE_SIZE },
+  { file: ARTIFACTS.arm64.file, maximumSize: MAX_EXECUTABLE_SIZE },
+];
+
+export interface BridgeArtifactSource {
+  readonly directory: string;
+  readonly dispose: () => Promise<void>;
+}
+
+export function bridgeReleaseAssetUrl(location: BridgeRelease, file: string): string {
+  return `https://github.com/${location.repository}/releases/download/${location.tag}/${file}`;
+}
+
+export async function downloadBridgeArtifacts(
+  location: BridgeRelease,
+  destinationDirectory: string,
+  fetchImpl: typeof fetch = fetch,
+  token: string | undefined = process.env.GITHUB_TOKEN,
+): Promise<void> {
+  await mkdir(destinationDirectory, { recursive: true });
+
+  for (const { file, maximumSize } of RELEASE_ASSETS) {
+    const url = bridgeReleaseAssetUrl(location, file);
+    const headers: Record<string, string> = { accept: 'application/octet-stream' };
+    if (token) {
+      headers.authorization = `Bearer ${token}`;
+    }
+
+    const response = await fetchImpl(url, { headers, redirect: 'follow' });
+    if (!response.ok) {
+      throw new Error(`Failed to download ${url} (${response.status})`);
+    }
+
+    const declaredLength = Number(response.headers.get('content-length') ?? '0');
+    if (declaredLength > maximumSize) {
+      throw new Error(`${file} has an invalid size`);
+    }
+    const contents = Buffer.from(await response.arrayBuffer());
+    if (contents.length <= 0 || contents.length > maximumSize) {
+      throw new Error(`${file} has an invalid size`);
+    }
+
+    await writeFile(join(destinationDirectory, file), contents);
+  }
+}
+
+export async function resolveBridgeArtifactSource(
   extensionRoot: string,
-  environmentDirectory: string | undefined = process.env.WSLC_BRIDGE_ARTIFACT_DIR,
-): Promise<string> {
-  if (environmentDirectory !== undefined) {
-    if (!environmentDirectory.trim()) {
+  environment: NodeJS.ProcessEnv = process.env,
+): Promise<BridgeArtifactSource> {
+  const configuredDirectory = environment.WSLC_BRIDGE_ARTIFACT_DIR;
+  if (configuredDirectory !== undefined) {
+    if (!configuredDirectory.trim()) {
       throw new Error('WSLC_BRIDGE_ARTIFACT_DIR must name a local artifact directory');
     }
-    return resolve(environmentDirectory);
+    return { directory: resolve(configuredDirectory), dispose: noDispose };
   }
 
   const buildArtifactDirectory = join(extensionRoot, 'build', 'bridge-artifacts');
   if (await isRegularFile(join(buildArtifactDirectory, 'bridge-manifest.json'))) {
-    return buildArtifactDirectory;
+    return { directory: buildArtifactDirectory, dispose: noDispose };
   }
 
-  return resolve(extensionRoot, '..', 'wslc-bridge', 'dist');
+  // Hosted builds must not depend on a sibling checkout, so the developer fallback is local only.
+  if (!environment.CI) {
+    const siblingDirectory = resolve(extensionRoot, '..', 'wslc-bridge', 'dist');
+    if (await isRegularFile(join(siblingDirectory, 'bridge-manifest.json'))) {
+      return { directory: siblingDirectory, dispose: noDispose };
+    }
+  }
+
+  const release: BridgeRelease = {
+    repository: environment.WSLC_BRIDGE_RELEASE_REPOSITORY ?? BRIDGE_RELEASE.repository,
+    tag: environment.WSLC_BRIDGE_RELEASE_TAG ?? BRIDGE_RELEASE.tag,
+  };
+  const downloadDirectory = await mkdtemp(join(tmpdir(), 'wslc-bridge-release-'));
+  try {
+    await downloadBridgeArtifacts(release, downloadDirectory, fetch, environment.GITHUB_TOKEN);
+  } catch (error: unknown) {
+    await rm(downloadDirectory, { recursive: true, force: true });
+    throw error;
+  }
+
+  return {
+    directory: downloadDirectory,
+    dispose: async (): Promise<void> => {
+      await rm(downloadDirectory, { recursive: true, force: true });
+    },
+  };
+}
+
+function noDispose(): Promise<void> {
+  return Promise.resolve();
 }
 
 export async function stageBridgeArtifacts(
@@ -360,8 +442,14 @@ const extensionRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const scriptPath = process.argv[1] ? resolve(process.argv[1]) : undefined;
 if (scriptPath === fileURLToPath(import.meta.url)) {
   const outputBinDirectory = join(extensionRoot, 'dist', 'bin');
-  resolveBridgeArtifactDirectory(extensionRoot)
-    .then(sourceDirectory => stageBridgeArtifacts(sourceDirectory, outputBinDirectory))
+  resolveBridgeArtifactSource(extensionRoot)
+    .then(async source => {
+      try {
+        await stageBridgeArtifacts(source.directory, outputBinDirectory);
+      } finally {
+        await source.dispose();
+      }
+    })
     .catch((error: unknown) => {
       console.error(error);
       process.exitCode = 1;

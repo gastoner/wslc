@@ -20,7 +20,21 @@ export type BridgeArchitecture = 'amd64' | 'arm64';
 
 export type BridgeArtifactPins = Readonly<Record<BridgeArchitecture, string>>;
 
+export interface BridgeRelease {
+  readonly repository: string;
+  readonly tag: string;
+}
+
+/**
+ * The published bridge release the extension packages. Bumping the tag requires updating
+ * BRIDGE_ARTIFACT_SHA256 with the digests from that release's checksums.txt.
+ */
+export const BRIDGE_RELEASE: BridgeRelease = {
+  repository: 'gastoner/wslc-bridge',
+  tag: 'v0.0.1',
+};
+
 export const BRIDGE_ARTIFACT_SHA256: BridgeArtifactPins = {
-  amd64: '0372c9a5c226ac9a79f6860f0b2ff07adfc90774cbdef1d95e6f9d0115b2a16a',
-  arm64: '9807683cf3f33996de8de4a49f643b03fad60f40031dd71930d34d6b69384945',
+  amd64: 'b9f0a90e70c66e274fe6afdadf05ab48ce033a5ad645425c2d0d4affe052ed8a',
+  arm64: '484e39febfdeb4c40b049966c7d6f18754974dc21d99942bfe7ac14d8dbf0fa5',
 };

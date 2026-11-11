@@ -45,34 +45,56 @@ README for the full route table and WSL version gates.
 
 ## Bridge binaries and local builds
 
-The bridge is built independently in the sibling `wslc-bridge` project. The extension never
-compiles Go. It packages both pinned Windows executables and selects one at runtime:
+The bridge is built and released independently by
+[`wslc-bridge`](https://github.com/gastoner/wslc-bridge); the extension never compiles Go.
+`pnpm download-dependencies` fetches both pinned Windows executables from that repository's release and selects one at
+runtime:
 
 ```text
 dist/bin/win32-x64/wslc-bridge.exe   (Node x64)
 dist/bin/win32-arm64/wslc-bridge.exe (Node ARM64)
 ```
 
-The bridge manifest and SHA-256 checksum file pin the exact binary bytes. The extension staging script verifies the
-manifest, both checksums, and each PE machine type before writing either executable. It stages both artifacts
-transactionally; it does not download an unpinned branch or use a TCP fallback.
+`src/config/bridge-artifacts.ts` records the release (`BRIDGE_RELEASE`) and the per-architecture SHA-256 pins
+(`BRIDGE_ARTIFACT_SHA256`). The staging script verifies the release manifest, both checksums, the pins, and each PE
+machine type before writing either executable. It stages both artifacts transactionally; it does not download an
+unpinned branch or use a TCP fallback.
+
+Artifact sources are resolved in this order:
+
+1. `WSLC_BRIDGE_ARTIFACT_DIR` — an explicit local directory.
+2. `build/bridge-artifacts` — when it contains `bridge-manifest.json`.
+3. `../wslc-bridge/dist` — only outside CI, for local development against a sibling checkout.
+4. The pinned GitHub release — the hosted-build default (`CI=true` skips step 3).
+
+`WSLC_BRIDGE_RELEASE_REPOSITORY` and `WSLC_BRIDGE_RELEASE_TAG` override the release recorded in source, and
+`GITHUB_TOKEN` is forwarded when set.
 
 For local extension development from PowerShell:
 
 ```powershell
-$env:WSLC_BRIDGE_ARTIFACT_DIR = (Resolve-Path ..\wslc-bridge\dist).Path
 pnpm install --frozen-lockfile
 pnpm download-dependencies
 pnpm build
 ```
 
-For a local OCI build, stage the four bridge files in `build/bridge-artifacts` so the `Containerfile` picks them up:
+The `Containerfile` runs the same download, so pre-staging is only needed when you want to build an image from locally
+produced binaries:
 
 ```powershell
 New-Item -ItemType Directory -Force build\bridge-artifacts | Out-Null
-Copy-Item "$env:WSLC_BRIDGE_ARTIFACT_DIR\*" build\bridge-artifacts\
+Copy-Item "..\wslc-bridge\dist\*" build\bridge-artifacts\
 podman build -t wslc-local .
 ```
+
+### Releasing a new bridge version
+
+1. Run the `release` workflow in [`wslc-bridge`](https://github.com/gastoner/wslc-bridge) with the new version. It runs
+   vet and tests, cross-builds both Windows executables, and attaches
+   `wslc-bridge-windows-{amd64,arm64}.exe`, `checksums.txt`, and `bridge-manifest.json` to the release.
+2. Copy both digests from that release's `checksums.txt` into `BRIDGE_ARTIFACT_SHA256` and update
+   `BRIDGE_RELEASE.tag` in `src/config/bridge-artifacts.ts`.
+3. Release the extension; the image build downloads and verifies the new bridge.
 
 To build and diagnose the standalone executable directly, see the sibling bridge project's README. On Windows, the
 extension starts it, waits for its JSON readiness record and named-pipe health check, polls it every 30 seconds, and
@@ -104,6 +126,9 @@ cross-built; validate them on ARM64 Windows hardware before claiming runtime sup
 ## Development checks
 
 Prerequisites: Node.js 24 from [`.nvmrc`](.nvmrc) and the pinned pnpm version from [`package.json`](package.json).
+Every workflow installs Node with `node-version-file: .nvmrc`, so bumping `.nvmrc` is enough for CI. The `Containerfile`
+base image (`ubi10/nodejs-24`) and `package.json` `engines.node` are not derived from it and must be updated by hand in
+the same change.
 
 ```bash
 nvm use
