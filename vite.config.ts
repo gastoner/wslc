@@ -31,7 +31,7 @@ export default defineConfig({
     outDir: 'dist',
     assetsDir: '.',
     lib: {
-      entry: join(packageRoot, 'src/extension.ts'),
+      entry: join(packageRoot, 'src/main.ts'),
       formats: ['cjs'],
     },
     rolldownOptions: {
@@ -40,7 +40,8 @@ export default defineConfig({
         entryFileNames: '[name].cjs',
       },
     },
-    emptyOutDir: true,
+    // The bridge executables are staged into dist/bin before the build runs.
+    emptyOutDir: false,
     reportCompressedSize: false,
   },
 });

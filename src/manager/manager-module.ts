@@ -16,8 +16,15 @@
  * SPDX-License-Identifier: Apache-2.0
  ***********************************************************************/
 
-import type { ExtensionContext } from '@podman-desktop/api';
+import { ContainerModule } from 'inversify';
+import { WslVersionService } from './wsl-version-service';
+import { WslcBridgeManager } from './wslc-bridge-manager';
+import { WslcProviderManager } from './wslc-provider-manager';
 
-export async function activate(_extensionContext: ExtensionContext): Promise<void> {}
+const managersModule = new ContainerModule(options => {
+  options.bind<WslVersionService>(WslVersionService).toSelf().inSingletonScope();
+  options.bind<WslcBridgeManager>(WslcBridgeManager).toSelf().inSingletonScope();
+  options.bind<WslcProviderManager>(WslcProviderManager).toSelf().inSingletonScope();
+});
 
-export async function deactivate(): Promise<void> {}
+export { managersModule };
