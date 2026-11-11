@@ -17,7 +17,33 @@
  ***********************************************************************/
 
 import type { ExtensionContext } from '@podman-desktop/api';
+import { WslcExtension } from './wslc-extension';
 
-export async function activate(_extensionContext: ExtensionContext): Promise<void> {}
+let wslcExtension: WslcExtension | undefined;
 
-export async function deactivate(): Promise<void> {}
+export async function activate(extensionContext: ExtensionContext): Promise<void> {
+  wslcExtension ??= new WslcExtension(extensionContext);
+  const extension = wslcExtension;
+  try {
+    await extension.activate();
+  } catch (error: unknown) {
+    if (wslcExtension === extension) {
+      wslcExtension = undefined;
+    }
+    throw error;
+  }
+}
+
+export async function deactivate(): Promise<void> {
+  try {
+    await wslcExtension?.deactivate();
+  } finally {
+    wslcExtension = undefined;
+  }
+}
+
+if (process.env.NODE_ENV === 'test') {
+  Object.defineProperty(global, 'wslcExtension', {
+    get: () => wslcExtension,
+  });
+}
